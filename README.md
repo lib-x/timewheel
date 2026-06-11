@@ -285,6 +285,70 @@ The core package handles delay, repeat, cancel, execution, and inspection. Cron
 expressions, persistent scheduling, orchestration, and business-key mapping
 belong in separate packages layered on top.
 
+## Keyed Scheduler
+
+The `scheduler` subpackage provides a keyed dynamic scheduler built on top of
+the core time wheel. It keeps cron-like, calendar, and business schedule logic
+outside the core package by requiring callers to provide the next-run
+calculation.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/lib-x/timewheel/scheduler"
+)
+
+func main() {
+    s, err := scheduler.NewScheduler[string, string](
+        scheduler.Options[string, string]{
+            Next: func(now time.Time, key string, data string) (time.Time, bool, error) {
+                return now.Add(time.Minute), true, nil
+            },
+            Run: func(ctx context.Context, key string, data string) error {
+                fmt.Println("run", key, data)
+                return nil
+            },
+        },
+        scheduler.WithReschedulePolicy(scheduler.RescheduleAfterFinish),
+        scheduler.WithWheel(time.Second, 3600),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := s.Upsert(scheduler.Item[string, string]{
+        Key:  "daily-report",
+        Data: "payload",
+    }); err != nil {
+        log.Fatal(err)
+    }
+
+    if err := s.Start(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+    defer s.Close()
+}
+```
+
+Scheduler features:
+
+- `Upsert`, `ReplaceAll`, and `Remove` manage items by key.
+- `Snapshot` returns pending, running, disabled, and invalid runtime state.
+- `NextFunc` is the only place that calculates the next execution time.
+- generation tracking prevents stale timers and stale completions from
+  rescheduling removed or replaced items.
+- `CancelRunningOnRemove`, `CancelRunningOnReplace`, `WaitRunningOnClose`, and
+  `RunTimeout` control running job lifecycle and can be configured with
+  functional options.
+- `RescheduleAfterFinish` avoids self-overlap, `RescheduleBeforeRun` supports a
+  fixed cadence, and `NoAutoReschedule` leaves rescheduling to the caller.
+
 ## License
 
 MIT
