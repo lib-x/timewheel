@@ -155,6 +155,14 @@ Repeat modes:
 - `FixedDelay`: waits for the previous job to return, then waits the delay. Jobs do not overlap.
 - `SkipIfRunning`: keeps a fixed-rate cadence but skips a fire if the previous job is still running.
 
+`FixedRate` and `SkipIfRunning` stay anchored to the schedule grid: occurrence
+n is scheduled for `start + n*delay`, so per-dispatch lateness does not
+accumulate into long-term drift. When the wheel falls more than one full
+period behind (for example after a stall), missed periods are skipped and the
+timer realigns to the next future grid point instead of firing a burst.
+`JobEvent.Lateness` reports how far behind an execution started. `FixedDelay`
+intentionally re-anchors at job completion time.
+
 The zero-value `RepeatOptions{}` uses `FixedRate`.
 
 ### Removing Timers
@@ -192,11 +200,16 @@ type JobObserver[T any] func(JobEvent[T])
 func WithJobObserver[T any](observer JobObserver[T]) Option[T]
 func WithErrorHandler[T any](h func(recovered any)) Option[T]
 func WithLogger[T any](l Logger) Option[T]
+func WithClock[T any](clk Clock) Option[T]
 ```
 
 `JobContext` errors are reported through `JobEvent.Err`. Panics are recovered
 when an error handler or observer is configured. Without either, a panic keeps
 normal Go behavior and crashes the program.
+
+`WithClock` overrides the wheel's time source through the `Clock` and `Ticker`
+interfaces. It exists so tests can drive the wheel deterministically with a
+fake clock.
 
 ### Worker Pool
 
@@ -272,6 +285,25 @@ pos    = (currentPos + offset) % slotNum
 The event loop scans one slot on every tick, dispatches due tasks, then advances
 the wheel pointer.
 
+### Timing Guarantees
+
+Dispatch happens no earlier than the scheduled time and can be delayed by up
+to one tick plus runtime scheduling jitter. The wheel position advances one
+slot per received tick: if the event loop stalls long enough that the runtime
+ticker drops ticks (for example under the `Block` backpressure policy or a
+slow `RunInline` job), the wheel falls behind wall-clock time and dispatches
+late rather than compensating. Grid anchoring keeps repeating timers from
+accumulating that lag into permanent drift, and `JobEvent.Lateness` makes it
+observable.
+
+### Concurrency Model
+
+All slot and index mutations are serialized onto the event loop goroutine
+through an internal command channel; wheel slots are accessed without locks.
+`Add*` and `RemoveTimer` block until the event loop acknowledges the command,
+so a timer is queryable through `NextFireTime` as soon as its `Add*` call
+returns. Inspection APIs read a shared index guarded by an RWMutex.
+
 ### Deletion Complexity
 
 The wheel keeps a `TimerID -> slot/index` location index. `RemoveTimer` uses the
@@ -346,6 +378,8 @@ Scheduler features:
 - `CancelRunningOnRemove`, `CancelRunningOnReplace`, `WaitRunningOnClose`, and
   `RunTimeout` control running job lifecycle and can be configured with
   functional options.
+- `WithClock` injects a fake clock into the scheduler and its wheel for
+  deterministic tests.
 - `RescheduleAfterFinish` avoids self-overlap, `RescheduleBeforeRun` supports a
   fixed cadence, and `NoAutoReschedule` leaves rescheduling to the caller.
 
