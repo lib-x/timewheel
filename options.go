@@ -7,7 +7,7 @@ type config[T any] struct {
 	errorHandler func(recovered any)
 	observer     JobObserver[T]
 	logger       Logger
-	clock        clock
+	clock        Clock
 }
 
 // Option is a functional option for New.
@@ -61,6 +61,8 @@ func WithLogger[T any](l Logger) Option[T] {
 	return func(c *config[T]) { c.logger = l }
 }
 
-func withClock[T any](clk clock) Option[T] {
+// WithClock overrides the wheel's time source. A nil clock keeps the default
+// real-time clock. Intended for tests that need deterministic time.
+func WithClock[T any](clk Clock) Option[T] {
 	return func(c *config[T]) { c.clock = clk }
 }

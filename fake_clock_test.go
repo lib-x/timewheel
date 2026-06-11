@@ -22,7 +22,7 @@ func (c *fakeClock) Now() time.Time {
 	return c.now
 }
 
-func (c *fakeClock) NewTicker(time.Duration) ticker {
+func (c *fakeClock) NewTicker(time.Duration) Ticker {
 	t := &fakeTicker{ch: make(chan time.Time, 16)}
 	c.mu.Lock()
 	c.tickers = append(c.tickers, t)
@@ -75,7 +75,7 @@ func TestFakeClockDrivesOneShotTimer(t *testing.T) {
 		10*time.Millisecond,
 		4,
 		func(struct{}) { close(fired) },
-		withClock[struct{}](clk),
+		WithClock[struct{}](clk),
 	)
 	if err != nil {
 		t.Fatal(err)

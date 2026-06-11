@@ -1002,6 +1002,100 @@ func TestPendingTimersRepeatingMarked(t *testing.T) {
 	}
 }
 
+// TestFixedRateStaysOnScheduleGrid verifies that FixedRate repeats stay
+// anchored to the t0 + n*delay grid instead of drifting by per-dispatch
+// lateness, and that entirely missed periods are skipped, not bursted.
+func TestFixedRateStaysOnScheduleGrid(t *testing.T) {
+	t0 := time.Date(2026, 6, 12, 8, 0, 0, 0, time.UTC)
+	clk := newFakeClock(t0)
+	events := make(chan JobEvent[struct{}], 8)
+
+	tw, err := New[struct{}](
+		10*time.Millisecond,
+		4,
+		func(struct{}) {},
+		WithClock[struct{}](clk),
+		WithJobObserver[struct{}](func(e JobEvent[struct{}]) { events <- e }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	id, err := tw.AddRepeatingTimer(20*time.Millisecond, struct{}{}, RepeatOptions{Mode: FixedRate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tw.RemoveTimer(id) }()
+
+	// First fire lands exactly two ticks in.
+	clk.Advance(10 * time.Millisecond)
+	clk.Advance(10 * time.Millisecond)
+	e1 := waitEvent(t, events)
+
+	// Process the second occurrence 78ms late: the t0+40ms fire happens at
+	// t0+118ms. The next occurrence must realign to the grid (t0+120ms)
+	// instead of drifting to dispatch time + delay (t0+138ms).
+	clk.Advance(93 * time.Millisecond)
+	clk.Advance(5 * time.Millisecond)
+	e2 := waitEvent(t, events)
+
+	clk.Advance(10 * time.Millisecond)
+	e3 := waitEvent(t, events)
+
+	want := []time.Time{
+		t0.Add(20 * time.Millisecond),
+		t0.Add(40 * time.Millisecond),
+		t0.Add(120 * time.Millisecond),
+	}
+	for i, e := range []JobEvent[struct{}]{e1, e2, e3} {
+		if !e.ScheduledFor.Equal(want[i]) {
+			t.Fatalf("fire %d ScheduledFor: got %s, want %s", i+1, e.ScheduledFor, want[i])
+		}
+	}
+	if got := e2.Lateness; got != 78*time.Millisecond {
+		t.Fatalf("late fire Lateness: got %s, want 78ms", got)
+	}
+}
+
+// TestTickUpdatesLocationsAfterExtraction verifies the partial re-index in
+// tick: tasks before the first extracted task keep their slot index, tasks
+// after it shift left, and extracted one-shot tasks leave the index.
+func TestTickUpdatesLocationsAfterExtraction(t *testing.T) {
+	tw, err := New[int](time.Hour, 4, func(int) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	add := func(id TimerID, circle int) {
+		tk := &task[int]{circle: circle, key: id, delay: time.Hour, mode: modeOnce}
+		tw.slots[0] = append(tw.slots[0], tk)
+		tw.timerIndex[id] = timerMeta{
+			nextFireAt: now.Add(time.Hour),
+			delay:      time.Hour,
+			location:   timerLocation{slot: 0, index: len(tw.slots[0]) - 1},
+		}
+	}
+	add(1, 3) // stays, keeps index 0
+	add(2, 0) // due, extracted
+	add(3, 3) // stays, shifts from index 2 to 1
+
+	tw.tick()
+
+	tw.timerIndexMu.RLock()
+	defer tw.timerIndexMu.RUnlock()
+	if loc := tw.timerIndex[1].location; loc != (timerLocation{slot: 0, index: 0}) {
+		t.Fatalf("task 1 location: got %+v, want {0 0}", loc)
+	}
+	if loc := tw.timerIndex[3].location; loc != (timerLocation{slot: 0, index: 1}) {
+		t.Fatalf("task 3 location: got %+v, want {0 1}", loc)
+	}
+	if _, ok := tw.timerIndex[2]; ok {
+		t.Fatal("dispatched one-shot task still in index")
+	}
+}
+
 func BenchmarkAddTimer(b *testing.B) {
 	tw, err := New[int](time.Millisecond, 1000, func(int) {})
 	if err != nil {
@@ -1022,24 +1116,31 @@ func BenchmarkAddTimer(b *testing.B) {
 	})
 }
 
+// fillSlot places n never-due tasks directly into slot 0 of an unstarted
+// wheel so tick exercises the pending-task scan path. The benchmark goroutine
+// stands in for the event loop, which owns slots without locks.
+func fillSlot(tw *TimeWheel[int], n int) {
+	now := time.Now()
+	for i := range n {
+		id := TimerID(i + 1)
+		tk := &task[int]{circle: 1 << 30, key: id, delay: time.Hour, mode: modeOnce}
+		tw.slots[0] = append(tw.slots[0], tk)
+		tw.timerIndex[id] = timerMeta{
+			nextFireAt: now.Add(time.Hour),
+			delay:      time.Hour,
+			location:   timerLocation{slot: 0, index: i},
+		}
+	}
+}
+
 func BenchmarkTick(b *testing.B) {
-	for _, n := range []int{100, 1_000, 10_000} {
-		b.Run(fmt.Sprintf("tasks=%d", n), func(b *testing.B) {
-			tw, err := New[int](time.Hour, 3600, func(int) {})
+	for _, n := range []int{0, 100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("pending=%d", n), func(b *testing.B) {
+			tw, err := New[int](time.Millisecond, 1, func(int) {})
 			if err != nil {
 				b.Fatal(err)
 			}
-			if err := tw.Start(b.Context()); err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { _ = tw.Close() })
-
-			for i := range n {
-				if _, err := tw.AddTimer(time.Hour, i); err != nil {
-					b.Fatal(err)
-				}
-			}
-			time.Sleep(50 * time.Millisecond)
+			fillSlot(tw, n)
 
 			b.ResetTimer()
 			for b.Loop() {

@@ -2,12 +2,15 @@ package timewheel
 
 import "time"
 
-type clock interface {
+// Clock abstracts the time source used by the wheel. Implementations must be
+// safe for concurrent use. The default clock uses the time package.
+type Clock interface {
 	Now() time.Time
-	NewTicker(time.Duration) ticker
+	NewTicker(time.Duration) Ticker
 }
 
-type ticker interface {
+// Ticker is the minimal ticker surface consumed by the event loop.
+type Ticker interface {
 	C() <-chan time.Time
 	Stop()
 }
@@ -18,7 +21,7 @@ func (realClock) Now() time.Time {
 	return time.Now()
 }
 
-func (realClock) NewTicker(d time.Duration) ticker {
+func (realClock) NewTicker(d time.Duration) Ticker {
 	return realTicker{Ticker: time.NewTicker(d)}
 }
 

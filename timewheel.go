@@ -2,7 +2,8 @@
 //
 // TimeWheel is safe for concurrent use. Timer placement and deletion are
 // serialized through the wheel event loop; job execution is dispatched outside
-// the slot locks.
+// the event loop. Wheel slots are owned exclusively by the event loop
+// goroutine and are accessed without locks.
 package timewheel
 
 import (
@@ -152,11 +153,6 @@ type TimerInfo struct {
 	RepeatMode RepeatMode
 }
 
-type slot[T any] struct {
-	mu    sync.Mutex
-	tasks []*task[T]
-}
-
 type wheelCommand[T any] struct {
 	kind commandKind
 	task *task[T]
@@ -202,11 +198,15 @@ type TimeWheel[T any] struct {
 	slotNum    int
 	defaultJob Job[T]
 
-	slots []slot[T]
+	// slots, currentPos, and due are owned by the event loop goroutine and
+	// accessed without locks: every mutation happens on the loop started by
+	// Start, either while handling a tick or while handling a command.
+	slots      [][]*task[T]
+	currentPos int
+	due        []*task[T]
 
-	currentPos atomic.Int64
-	pool       sync.Pool
-	keyGen     atomic.Uint64
+	pool   sync.Pool
+	keyGen atomic.Uint64
 
 	commandCh chan wheelCommand[T]
 	done      chan struct{}
@@ -262,7 +262,7 @@ func New[T any](interval time.Duration, slotNum int, defaultJob Job[T], opts ...
 		interval:   interval,
 		slotNum:    slotNum,
 		defaultJob: defaultJob,
-		slots:      make([]slot[T], slotNum),
+		slots:      make([][]*task[T], slotNum),
 		commandCh:  make(chan wheelCommand[T], 64),
 		done:       make(chan struct{}),
 		timerIndex: make(map[TimerID]timerMeta),
@@ -446,7 +446,6 @@ func (tw *TimeWheel[T]) RemoveTimer(id TimerID) error {
 	return tw.sendCommand(wheelCommand[T]{
 		kind: commandRemove,
 		id:   id,
-		ack:  make(chan error, 1),
 	})
 }
 
@@ -516,7 +515,6 @@ func (tw *TimeWheel[T]) enqueue(delay time.Duration, data T, job Job[T], context
 	err := tw.sendCommand(wheelCommand[T]{
 		kind: commandAdd,
 		task: t,
-		ack:  make(chan error, 1),
 	})
 	if err != nil {
 		tw.releaseTask(t)
@@ -525,6 +523,13 @@ func (tw *TimeWheel[T]) enqueue(delay time.Duration, data T, job Job[T], context
 	return id, nil
 }
 
+// ackPool recycles the per-command acknowledgement channels. A channel is
+// returned to the pool only once no event-loop write to it can happen: after
+// its value was consumed, or once it is known the command was never processed.
+var ackPool = sync.Pool{New: func() any { return make(chan error, 1) }}
+
+// sendCommand submits cmd to the event loop and waits for the acknowledgement
+// that the command was applied.
 func (tw *TimeWheel[T]) sendCommand(cmd wheelCommand[T]) error {
 	tw.stateMu.Lock()
 	switch tw.state {
@@ -537,25 +542,44 @@ func (tw *TimeWheel[T]) sendCommand(cmd wheelCommand[T]) error {
 	}
 	tw.stateMu.Unlock()
 
+	ack := ackPool.Get().(chan error)
+	cmd.ack = ack
+
 	select {
 	case tw.commandCh <- cmd:
 	case <-tw.done:
+		ackPool.Put(ack)
 		return ErrClosed
 	}
 
-	if cmd.ack == nil {
-		return nil
-	}
 	select {
-	case err := <-cmd.ack:
+	case err := <-ack:
+		ackPool.Put(ack)
 		return err
 	case <-tw.done:
-		return ErrClosed
+		// The event loop acknowledges every command it handles before it
+		// exits, and tw.done is closed only after the loop has returned, so
+		// a buffered acknowledgement is guaranteed to be visible here. An
+		// empty channel means the command was never processed.
+		select {
+		case err := <-ack:
+			ackPool.Put(ack)
+			return err
+		default:
+			ackPool.Put(ack)
+			return ErrClosed
+		}
 	}
 }
 
+// placeNewTask inserts a newly added timer. It runs on the event loop.
 func (tw *TimeWheel[T]) placeNewTask(t *task[T]) {
 	nextFireAt := tw.cfg.clock.Now().Add(t.delay)
+	pos, circle := tw.calcPosCircle(t.delay)
+	t.circle = circle
+	t.scheduledFor = nextFireAt
+
+	tw.slots[pos] = append(tw.slots[pos], t)
 
 	tw.timerIndexMu.Lock()
 	tw.timerIndex[t.key] = timerMeta{
@@ -563,71 +587,86 @@ func (tw *TimeWheel[T]) placeNewTask(t *task[T]) {
 		delay:      t.delay,
 		mode:       t.mode,
 		repeatMode: t.repeatMode,
-		location:   noLocation(),
+		location:   timerLocation{slot: pos, index: len(tw.slots[pos]) - 1},
 	}
 	tw.timerIndexMu.Unlock()
-
-	tw.placeTask(t, nextFireAt)
+	tw.stats.pending.Add(1)
 }
 
-func (tw *TimeWheel[T]) placeTask(t *task[T], nextFireAt time.Time) {
-	pos, circle := tw.calcPosCircle(t.delay)
+// placeTask re-places a repeating timer so that it fires at nextFireAt, which
+// is wait from now. It runs on the event loop. If the timer was removed in
+// the meantime the task is discarded.
+func (tw *TimeWheel[T]) placeTask(t *task[T], nextFireAt time.Time, wait time.Duration) {
+	pos, circle := tw.calcPosCircle(wait)
 	t.circle = circle
 	t.scheduledFor = nextFireAt
 
-	s := &tw.slots[pos]
-	s.mu.Lock()
-	idx := len(s.tasks)
-	s.tasks = append(s.tasks, t)
-	s.mu.Unlock()
-
 	tw.timerIndexMu.Lock()
 	meta, ok := tw.timerIndex[t.key]
-	if ok {
-		meta.nextFireAt = nextFireAt
-		meta.location = timerLocation{slot: pos, index: idx}
-		tw.timerIndex[t.key] = meta
-		tw.stats.pending.Add(1)
-	} else {
-		tw.removeTaskFromSlot(pos, idx)
+	if !ok {
+		tw.timerIndexMu.Unlock()
 		tw.releaseTask(t)
+		return
 	}
+	tw.slots[pos] = append(tw.slots[pos], t)
+	meta.nextFireAt = nextFireAt
+	meta.location = timerLocation{slot: pos, index: len(tw.slots[pos]) - 1}
+	tw.timerIndex[t.key] = meta
 	tw.timerIndexMu.Unlock()
+	tw.stats.pending.Add(1)
 }
 
+// tick advances the wheel by one slot. It runs on the event loop.
 func (tw *TimeWheel[T]) tick() {
-	cur := int(tw.currentPos.Load())
-	s := &tw.slots[cur]
+	cur := tw.currentPos
+	tasks := tw.slots[cur]
 
-	s.mu.Lock()
-	remaining := s.tasks[:0]
-	var due []*task[T]
+	due := tw.due[:0]
+	remaining := tasks[:0]
+	firstDue := -1
 
-	for _, t := range s.tasks {
+	for i, t := range tasks {
 		if t.circle > 0 {
 			t.circle--
 			remaining = append(remaining, t)
 			continue
 		}
+		if firstDue < 0 {
+			firstDue = i
+		}
 		due = append(due, t)
 	}
 
-	clear(s.tasks[len(remaining):])
-	s.tasks = remaining
-	for i, t := range s.tasks {
-		tw.updateLocation(t.key, timerLocation{slot: cur, index: i})
-	}
-	s.mu.Unlock()
+	clear(tasks[len(remaining):])
+	tw.slots[cur] = remaining
 
-	for _, t := range due {
-		tw.clearLocation(t.key)
+	// Slot indexes only change when a due task was extracted: tasks before
+	// the first extraction keep their index, the rest shift left. Batch all
+	// index updates under one lock acquisition.
+	if len(due) > 0 {
+		tw.timerIndexMu.Lock()
+		for i := firstDue; i < len(remaining); i++ {
+			if meta, ok := tw.timerIndex[remaining[i].key]; ok {
+				meta.location = timerLocation{slot: cur, index: i}
+				tw.timerIndex[remaining[i].key] = meta
+			}
+		}
+		for _, t := range due {
+			if meta, ok := tw.timerIndex[t.key]; ok {
+				meta.location = noLocation()
+				tw.timerIndex[t.key] = meta
+			}
+		}
+		tw.timerIndexMu.Unlock()
 	}
 
-	tw.currentPos.Store(int64((cur + 1) % tw.slotNum))
+	tw.currentPos = (cur + 1) % tw.slotNum
 
 	for _, t := range due {
 		tw.dispatch(t)
 	}
+	clear(due)
+	tw.due = due[:0]
 }
 
 func (tw *TimeWheel[T]) dispatch(t *task[T]) {
@@ -682,7 +721,7 @@ func (tw *TimeWheel[T]) dispatchRepeating(t *task[T], item workItem[T]) {
 		if result != executeAccepted {
 			tw.markRunning(t.key, false)
 			if result == executeDropped {
-				tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+				tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode, t.scheduledFor)
 			}
 		}
 	case SkipIfRunning:
@@ -694,23 +733,23 @@ func (tw *TimeWheel[T]) dispatchRepeating(t *task[T], item workItem[T]) {
 				ScheduledFor: t.scheduledFor,
 				Skipped:      true,
 			})
-			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode, t.scheduledFor)
 			return
 		}
 		tw.markRunning(t.key, true)
 		result := tw.execute(item)
 		if result == executeAccepted {
-			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode, t.scheduledFor)
 			return
 		}
 		tw.markRunning(t.key, false)
 		if result == executeDropped {
-			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode, t.scheduledFor)
 		}
 	default:
 		result := tw.execute(item)
 		if result != executeCanceled {
-			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, FixedRate)
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, FixedRate, t.scheduledFor)
 		}
 	}
 }
@@ -864,22 +903,18 @@ func (tw *TimeWheel[T]) finishRepeatingJob(done jobDone[T]) {
 	tw.timerIndexMu.Unlock()
 
 	if done.repeatMode == FixedDelay {
-		tw.reenqueue(done.id, done.delay, done.data, done.job, done.contextJob, done.repeatMode)
+		tw.reenqueue(done.id, done.delay, done.data, done.job, done.contextJob, done.repeatMode, time.Time{})
 	}
 }
 
-func (tw *TimeWheel[T]) reenqueue(id TimerID, delay time.Duration, data T, job Job[T], contextJob JobContext[T], repeatMode RepeatMode) {
+// reenqueue places the next occurrence of a repeating timer. FixedRate and
+// SkipIfRunning stay anchored to the schedule grid (prev + n*delay), skipping
+// past periods that were missed entirely; FixedDelay waits delay from now.
+func (tw *TimeWheel[T]) reenqueue(id TimerID, delay time.Duration, data T, job Job[T], contextJob JobContext[T], repeatMode RepeatMode, prev time.Time) {
 	select {
 	case <-tw.ctx.Done():
 		return
 	default:
-	}
-
-	tw.timerIndexMu.RLock()
-	_, ok := tw.timerIndex[id]
-	tw.timerIndexMu.RUnlock()
-	if !ok {
-		return
 	}
 
 	t := tw.pool.Get().(*task[T])
@@ -892,19 +927,34 @@ func (tw *TimeWheel[T]) reenqueue(id TimerID, delay time.Duration, data T, job J
 		mode:       modeRepeat,
 		repeatMode: repeatMode,
 	}
-	tw.placeTask(t, tw.cfg.clock.Now().Add(delay))
+
+	now := tw.cfg.clock.Now()
+	next := now.Add(delay)
+	wait := delay
+	if repeatMode != FixedDelay && !prev.IsZero() {
+		next = nextGridTime(prev, delay, now)
+		wait = next.Sub(now)
+	}
+	tw.placeTask(t, next, wait)
+}
+
+// nextGridTime returns the first instant after now on the prev + n*period
+// grid. Missed periods are skipped rather than fired in a burst.
+func nextGridTime(prev time.Time, period time.Duration, now time.Time) time.Time {
+	next := prev.Add(period)
+	if next.After(now) {
+		return next
+	}
+	behind := now.Sub(next)
+	return next.Add((behind/period + 1) * period)
 }
 
 func (tw *TimeWheel[T]) clearTimers() {
 	for i := range tw.slots {
-		s := &tw.slots[i]
-		s.mu.Lock()
-		for _, t := range s.tasks {
+		for _, t := range tw.slots[i] {
 			tw.releaseTask(t)
 		}
-		clear(s.tasks)
-		s.tasks = nil
-		s.mu.Unlock()
+		tw.slots[i] = nil
 	}
 
 	tw.timerIndexMu.Lock()
@@ -930,54 +980,30 @@ func (tw *TimeWheel[T]) deleteTask(id TimerID) {
 	tw.stats.removed.Add(1)
 }
 
+// deleteFromSlot removes the task at loc using swap-and-shrink. It runs on
+// the event loop.
 func (tw *TimeWheel[T]) deleteFromSlot(loc timerLocation) {
-	s := &tw.slots[loc.slot]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if loc.index < 0 || loc.index >= len(s.tasks) {
+	tasks := tw.slots[loc.slot]
+	if loc.index < 0 || loc.index >= len(tasks) {
 		return
 	}
 
-	t := s.tasks[loc.index]
-	last := len(s.tasks) - 1
-	s.tasks[loc.index] = s.tasks[last]
-	s.tasks[last] = nil
-	s.tasks = s.tasks[:last]
+	t := tasks[loc.index]
+	last := len(tasks) - 1
+	tasks[loc.index] = tasks[last]
+	tasks[last] = nil
+	tw.slots[loc.slot] = tasks[:last]
 
 	if loc.index < last {
-		moved := s.tasks[loc.index]
-		tw.updateLocation(moved.key, loc)
+		tw.updateLocation(tasks[loc.index].key, loc)
 	}
 	tw.releaseTask(t)
-}
-
-func (tw *TimeWheel[T]) removeTaskFromSlot(slotIndex, taskIndex int) {
-	s := &tw.slots[slotIndex]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if taskIndex < 0 || taskIndex >= len(s.tasks) {
-		return
-	}
-	last := len(s.tasks) - 1
-	s.tasks[taskIndex] = s.tasks[last]
-	s.tasks[last] = nil
-	s.tasks = s.tasks[:last]
-	if taskIndex < last {
-		moved := s.tasks[taskIndex]
-		tw.updateLocation(moved.key, timerLocation{slot: slotIndex, index: taskIndex})
-	}
 }
 
 func (tw *TimeWheel[T]) removeFromIndex(id TimerID) {
 	tw.timerIndexMu.Lock()
 	delete(tw.timerIndex, id)
 	tw.timerIndexMu.Unlock()
-}
-
-func (tw *TimeWheel[T]) clearLocation(id TimerID) {
-	tw.updateLocation(id, noLocation())
 }
 
 func (tw *TimeWheel[T]) updateLocation(id TimerID, loc timerLocation) {
@@ -1025,8 +1051,7 @@ func (tw *TimeWheel[T]) calcPosCircle(delay time.Duration) (pos int, circle int)
 	}
 
 	offset := ticks - 1
-	cur := int(tw.currentPos.Load())
-	pos = (cur + offset) % tw.slotNum
+	pos = (tw.currentPos + offset) % tw.slotNum
 	circle = offset / tw.slotNum
 	return pos, circle
 }
