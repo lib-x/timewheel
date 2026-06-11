@@ -99,6 +99,7 @@ new -> running -> closed
 - `Stop` before `Start` returns `ErrNotStarted`.
 - `Stop` is idempotent after the wheel is running or closed.
 - `Close` is idempotent, stops the wheel, and waits for the event loop and worker pool.
+- After `Close` returns, `PendingTimers` is empty and `Stats().Pending` is zero.
 - Canceling the context passed to `Start` stops the wheel.
 
 Timer registration requires a running wheel. `Add*` and `RemoveTimer` return

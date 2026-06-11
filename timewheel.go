@@ -355,6 +355,7 @@ func (tw *TimeWheel[T]) run() {
 		tw.stateMu.Lock()
 		tw.state = stateClosed
 		tw.stateMu.Unlock()
+		tw.clearTimers()
 		tw.closeDone.Do(func() { close(tw.done) })
 	}()
 
@@ -868,6 +869,12 @@ func (tw *TimeWheel[T]) finishRepeatingJob(done jobDone[T]) {
 }
 
 func (tw *TimeWheel[T]) reenqueue(id TimerID, delay time.Duration, data T, job Job[T], contextJob JobContext[T], repeatMode RepeatMode) {
+	select {
+	case <-tw.ctx.Done():
+		return
+	default:
+	}
+
 	tw.timerIndexMu.RLock()
 	_, ok := tw.timerIndex[id]
 	tw.timerIndexMu.RUnlock()
@@ -886,6 +893,24 @@ func (tw *TimeWheel[T]) reenqueue(id TimerID, delay time.Duration, data T, job J
 		repeatMode: repeatMode,
 	}
 	tw.placeTask(t, tw.cfg.clock.Now().Add(delay))
+}
+
+func (tw *TimeWheel[T]) clearTimers() {
+	for i := range tw.slots {
+		s := &tw.slots[i]
+		s.mu.Lock()
+		for _, t := range s.tasks {
+			tw.releaseTask(t)
+		}
+		clear(s.tasks)
+		s.tasks = nil
+		s.mu.Unlock()
+	}
+
+	tw.timerIndexMu.Lock()
+	clear(tw.timerIndex)
+	tw.timerIndexMu.Unlock()
+	tw.stats.pending.Store(0)
 }
 
 func (tw *TimeWheel[T]) deleteTask(id TimerID) {

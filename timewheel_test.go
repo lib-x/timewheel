@@ -755,6 +755,13 @@ func TestRunInlineFixedDelayDoesNotDeadlockWhenCommandChannelIsFull(t *testing.T
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("Close did not return after inline fixed-delay job completed")
 	}
+
+	if pending := tw.PendingTimers(); len(pending) != 0 {
+		t.Fatalf("PendingTimers after Close: got %d, want 0", len(pending))
+	}
+	if pending := tw.Stats().Pending; pending != 0 {
+		t.Fatalf("Stats.Pending after Close: got %d, want 0", pending)
+	}
 }
 
 func TestWithLoggerRecordsStopReason(t *testing.T) {
