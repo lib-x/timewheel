@@ -3,9 +3,12 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lib-x/timewheel"
 )
 
 func TestNewSchedulerValidatesCallbacksAndWheel(t *testing.T) {
@@ -520,6 +523,171 @@ func TestRunTimeoutCancelsJobContext(t *testing.T) {
 		}
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("run context was not timed out")
+	}
+}
+
+// TestScheduleDoesNotResurrectFiredTimer pins the schedule-vs-fire race: when
+// the wheel timer fires after schedule added it but before schedule recorded
+// it on the entry, the stale recording must not bring the consumed timer back
+// as pending state.
+func TestScheduleDoesNotResurrectFiredTimer(t *testing.T) {
+	hookEntered := make(chan struct{})
+	releaseHook := make(chan struct{})
+	var hookOnce sync.Once
+
+	ran := make(chan struct{}, 1)
+	s, err := NewScheduler[string, int](Options[string, int]{
+		Next: onceAfter[string, int](time.Millisecond),
+		Run: func(ctx context.Context, key string, data int) error {
+			ran <- struct{}{}
+			return nil
+		},
+		ReschedulePolicy: NoAutoReschedule,
+	}, WithWheel(time.Millisecond, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.testHookAfterAddTimer = func() {
+		hookOnce.Do(func() {
+			close(hookEntered)
+			<-releaseHook
+		})
+	}
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	upsertDone := make(chan error, 1)
+	go func() {
+		upsertDone <- s.Upsert(Item[string, int]{Key: "a", Data: 1})
+	}()
+	<-hookEntered
+
+	// While schedule is stalled, the timer fires and the run completes.
+	select {
+	case <-ran:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("timer did not fire while schedule was stalled")
+	}
+	deadline := time.After(300 * time.Millisecond)
+	for s.Snapshot()["a"].State != StateDisabled {
+		select {
+		case <-deadline:
+			t.Fatalf("state while schedule stalled: got %s, want disabled", s.Snapshot()["a"].State)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	close(releaseHook)
+	if err := <-upsertDone; err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := s.Snapshot()["a"]
+	if runtime.State != StateDisabled {
+		t.Fatalf("state after stalled schedule resumed: got %s, want disabled", runtime.State)
+	}
+	if runtime.NextRunAt != nil {
+		t.Fatalf("NextRunAt after stalled schedule resumed: got %v, want nil", *runtime.NextRunAt)
+	}
+}
+
+type fakeClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	tickers []*fakeTicker
+}
+
+func newFakeClock(now time.Time) *fakeClock {
+	return &fakeClock{now: now}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) NewTicker(time.Duration) timewheel.Ticker {
+	tk := &fakeTicker{ch: make(chan time.Time, 16)}
+	c.mu.Lock()
+	c.tickers = append(c.tickers, tk)
+	c.mu.Unlock()
+	return tk
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	now := c.now
+	tickers := append([]*fakeTicker(nil), c.tickers...)
+	c.mu.Unlock()
+
+	for _, tk := range tickers {
+		tk.tick(now)
+	}
+}
+
+type fakeTicker struct {
+	mu      sync.Mutex
+	ch      chan time.Time
+	stopped bool
+}
+
+func (t *fakeTicker) C() <-chan time.Time { return t.ch }
+
+func (t *fakeTicker) Stop() {
+	t.mu.Lock()
+	t.stopped = true
+	t.mu.Unlock()
+}
+
+func (t *fakeTicker) tick(now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return
+	}
+	t.ch <- now
+}
+
+func TestWithClockDrivesSchedulerAndWheel(t *testing.T) {
+	t0 := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	clk := newFakeClock(t0)
+	ran := make(chan struct{}, 1)
+
+	s, err := NewScheduler[string, int](Options[string, int]{
+		Next: onceAfter[string, int](10 * time.Millisecond),
+		Run: func(ctx context.Context, key string, data int) error {
+			ran <- struct{}{}
+			return nil
+		},
+		ReschedulePolicy: NoAutoReschedule,
+	}, WithWheel(10*time.Millisecond, 4), WithClock(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.Upsert(Item[string, int]{Key: "a", Data: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := s.Snapshot()["a"]
+	if runtime.NextRunAt == nil || !runtime.NextRunAt.Equal(t0.Add(10*time.Millisecond)) {
+		t.Fatalf("NextRunAt from fake clock: got %v, want %s", runtime.NextRunAt, t0.Add(10*time.Millisecond))
+	}
+
+	clk.Advance(10 * time.Millisecond)
+	select {
+	case <-ran:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("fake clock tick did not fire scheduled run")
 	}
 }
 

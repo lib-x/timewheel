@@ -93,6 +93,7 @@ type config struct {
 	wheelInterval time.Duration
 	wheelSlots    int
 	wheelOptions  []timewheel.Option[any]
+	clock         timewheel.Clock
 
 	cancelRunningOnRemove  bool
 	cancelRunningOnReplace bool
@@ -116,6 +117,14 @@ func WithWheel(interval time.Duration, slots int) Option {
 func WithWheelOptions(opts ...timewheel.Option[any]) Option {
 	return func(c *config) {
 		c.wheelOptions = append(c.wheelOptions, opts...)
+	}
+}
+
+// WithClock overrides the scheduler's time source and that of the underlying
+// wheel. A nil clock keeps the default real-time clock. Intended for tests.
+func WithClock(clk timewheel.Clock) Option {
+	return func(c *config) {
+		c.clock = clk
 	}
 }
 
@@ -169,11 +178,20 @@ type Scheduler[K comparable, T any] struct {
 
 	runSeq uint64
 	wg     sync.WaitGroup
+
+	// testHookAfterAddTimer, when non-nil, runs between adding a wheel timer
+	// and recording it on the entry. Test-only.
+	testHookAfterAddTimer func()
 }
 
 type entry[T any] struct {
 	data       T
 	generation uint64
+
+	// fireSeq counts how many wheel timers for this entry have fired. It
+	// lets schedule detect that the timer it just added already fired before
+	// the timer could be recorded on the entry.
+	fireSeq uint64
 
 	baseState State
 	lastState State
@@ -283,7 +301,7 @@ func (s *Scheduler[K, T]) Start(ctx context.Context) error {
 			}
 			s.fire(req)
 		},
-		s.cfg.wheelOptions...,
+		s.wheelOptions()...,
 	)
 	if err != nil {
 		s.mu.Unlock()
@@ -561,8 +579,7 @@ func (s *Scheduler[K, T]) schedule(key K, generation uint64, data T) {
 	}
 	s.mu.Unlock()
 
-	now := time.Now()
-	next, ok, err := s.opts.Next(now, key, data)
+	next, ok, err := s.opts.Next(s.now(), key, data)
 	if err != nil {
 		s.markInvalid(key, generation, data, err)
 		return
@@ -573,18 +590,24 @@ func (s *Scheduler[K, T]) schedule(key K, generation uint64, data T) {
 	}
 
 	var timerID timewheel.TimerID
-	var addErr error
 
 	s.mu.Lock()
-	started := s.started && !s.closed && s.wheel != nil
+	item, ok = s.items[key]
+	if !ok || s.closed || item.generation != generation {
+		s.mu.Unlock()
+		return
+	}
+	started := s.started && s.wheel != nil
 	wheel := s.wheel
+	fireSeq := item.fireSeq
 	s.mu.Unlock()
 
 	if started {
-		delay := time.Until(next)
+		delay := next.Sub(s.now())
 		if delay < 0 {
 			delay = 0
 		}
+		var addErr error
 		timerID, addErr = wheel.AddTimer(delay, runRequest[K, T]{
 			key:        key,
 			data:       data,
@@ -594,15 +617,25 @@ func (s *Scheduler[K, T]) schedule(key K, generation uint64, data T) {
 			s.markInvalid(key, generation, data, addErr)
 			return
 		}
+		if s.testHookAfterAddTimer != nil {
+			s.testHookAfterAddTimer()
+		}
 	}
 
 	s.mu.Lock()
 	item, current := s.items[key]
 	if !current || s.closed || item.generation != generation {
 		s.mu.Unlock()
-		if started && addErr == nil {
+		if started {
 			_ = wheel.RemoveTimer(timerID)
 		}
+		return
+	}
+	if started && item.fireSeq != fireSeq {
+		// The timer fired before it could be recorded on the entry; the fire
+		// path already advanced the entry state, so recording it now would
+		// resurrect an already-consumed timer.
+		s.mu.Unlock()
 		return
 	}
 	item.baseState = StatePending
@@ -661,6 +694,7 @@ func (s *Scheduler[K, T]) fire(req runRequest[K, T]) {
 		s.mu.Unlock()
 		return
 	}
+	item.fireSeq++
 	item.hasTimer = false
 	item.timerID = 0
 	item.nextRunAt = nil
@@ -701,7 +735,7 @@ func (s *Scheduler[K, T]) startRun(key K, generation uint64, data T) (uint64, co
 	} else {
 		ctx, cancel = context.WithCancel(ctx)
 	}
-	startedAt := time.Now()
+	startedAt := s.now()
 	if item.running == nil {
 		item.running = make(map[uint64]runningJob)
 	}
@@ -757,6 +791,23 @@ func (s *Scheduler[K, T]) finishRun(key K, generation uint64, runID uint64, data
 	if scheduleNext {
 		s.schedule(key, generation, data)
 	}
+}
+
+// wheelOptions assembles the options passed to the underlying wheel.
+func (s *Scheduler[K, T]) wheelOptions() []timewheel.Option[any] {
+	opts := s.cfg.wheelOptions
+	if s.cfg.clock != nil {
+		opts = append(opts[:len(opts):len(opts)], timewheel.WithClock[any](s.cfg.clock))
+	}
+	return opts
+}
+
+// now returns the current time from the configured clock.
+func (s *Scheduler[K, T]) now() time.Time {
+	if s.cfg.clock != nil {
+		return s.cfg.clock.Now()
+	}
+	return time.Now()
 }
 
 func (s *Scheduler[K, T]) ensureEntryLocked(key K, data T) *entry[T] {
