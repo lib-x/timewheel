@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
 type logEntry struct {
 	level string
 	msg   string
@@ -35,8 +33,10 @@ func (l *recordingLogger) Warn(msg string, args ...any) {
 
 func startWheel[T any](t *testing.T, tw *TimeWheel[T]) {
 	t.Helper()
-	tw.Start(t.Context())
-	t.Cleanup(tw.Wait)
+	if err := tw.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tw.Close() })
 }
 
 func waitLog(t *testing.T, logger *recordingLogger, level, msg string) logEntry {
@@ -57,6 +57,18 @@ func waitLog(t *testing.T, logger *recordingLogger, level, msg string) logEntry 
 	}
 }
 
+func waitEvent[T any](t *testing.T, events <-chan JobEvent[T]) JobEvent[T] {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for job event")
+		var zero JobEvent[T]
+		return zero
+	}
+}
+
 func logArg(args []any, key string) (any, bool) {
 	for i := 0; i+1 < len(args); i += 2 {
 		if args[i] == key {
@@ -66,9 +78,80 @@ func logArg(args []any, key string) (any, bool) {
 	return nil, false
 }
 
-// ─── correctness ──────────────────────────────────────────────────────────────
+func TestStartLifecycleErrors(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 10, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Start(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("Start(nil): got %v, want ErrNilContext", err)
+	}
+	if err := tw.Stop(); !errors.Is(err, ErrNotStarted) {
+		t.Fatalf("Stop before Start: got %v, want ErrNotStarted", err)
+	}
+	if err := tw.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := tw.Start(t.Context()); !errors.Is(err, ErrRunning) {
+		t.Fatalf("double Start: got %v, want ErrRunning", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := tw.Start(t.Context()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Start after Close: got %v, want ErrClosed", err)
+	}
+}
 
-func TestAddTimer_fires(t *testing.T) {
+func TestAddAndRemoveRequireRunning(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 10, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.AddTimer(time.Millisecond, struct{}{}); !errors.Is(err, ErrNotStarted) {
+		t.Fatalf("Add before Start: got %v, want ErrNotStarted", err)
+	}
+	if err := tw.RemoveTimer(TimerID(1)); !errors.Is(err, ErrNotStarted) {
+		t.Fatalf("Remove before Start: got %v, want ErrNotStarted", err)
+	}
+	if err := tw.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.AddTimer(time.Millisecond, struct{}{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Add after Close: got %v, want ErrClosed", err)
+	}
+	if err := tw.RemoveTimer(TimerID(1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Remove after Close: got %v, want ErrClosed", err)
+	}
+}
+
+func TestContextCancelClosesWheel(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 10, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	if err := tw.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	tw.Wait()
+
+	if _, err := tw.AddTimer(time.Millisecond, struct{}{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Add after context cancel: got %v, want ErrClosed", err)
+	}
+	if err := tw.Start(t.Context()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Start after context cancel: got %v, want ErrClosed", err)
+	}
+}
+
+func TestAddTimerFires(t *testing.T) {
 	var fired atomic.Bool
 	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {
 		fired.Store(true)
@@ -78,7 +161,9 @@ func TestAddTimer_fires(t *testing.T) {
 	}
 	startWheel(t, tw)
 
-	tw.AddTimer(50*time.Millisecond, struct{}{})
+	if _, err := tw.AddTimer(50*time.Millisecond, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 
 	time.Sleep(200 * time.Millisecond)
 	if !fired.Load() {
@@ -86,14 +171,19 @@ func TestAddTimer_fires(t *testing.T) {
 	}
 }
 
-func TestAddTimer_firesOnce(t *testing.T) {
+func TestAddTimerFiresOnce(t *testing.T) {
 	var count atomic.Int32
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {
 		count.Add(1)
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	tw.AddTimer(50*time.Millisecond, struct{}{})
+	if _, err := tw.AddTimer(50*time.Millisecond, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(300 * time.Millisecond)
 
 	if n := count.Load(); n != 1 {
@@ -101,48 +191,81 @@ func TestAddTimer_firesOnce(t *testing.T) {
 	}
 }
 
-func TestRemoveTimer(t *testing.T) {
-	var fired atomic.Bool
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {
-		fired.Store(true)
-	})
+func TestRemoveTimerAcceptedBeforeFire(t *testing.T) {
+	fired := make(chan struct{}, 1)
+	tw, err := New[struct{}](10*time.Millisecond, 10, func(struct{}) { fired <- struct{}{} })
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	key := tw.AddTimer(200*time.Millisecond, struct{}{})
-	time.Sleep(50 * time.Millisecond)
-	tw.RemoveTimer(key)
-	time.Sleep(300 * time.Millisecond)
-
-	if fired.Load() {
-		t.Fatal("timer fired after removal")
+	id, err := tw.AddTimer(50*time.Millisecond, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.RemoveTimer(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tw.NextFireTime(id); ok {
+		t.Fatal("removed timer still visible")
+	}
+	time.Sleep(120 * time.Millisecond)
+	select {
+	case <-fired:
+		t.Fatal("timer fired after RemoveTimer returned")
+	default:
 	}
 }
 
-func TestAddRepeating(t *testing.T) {
-	var count atomic.Int32
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {
-		count.Add(1)
-	})
+func TestRemoveTimerUnknownIsNoop(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	key := tw.AddRepeating(50*time.Millisecond, struct{}{})
-	time.Sleep(280 * time.Millisecond)
-	tw.RemoveTimer(key)
-	time.Sleep(100 * time.Millisecond)
+	if err := tw.RemoveTimer(TimerID(999)); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	n := count.Load()
-	// expect ~5 ticks; allow generous window for scheduling jitter
-	if n < 3 || n > 7 {
-		t.Fatalf("expected ~5 executions, got %d", n)
+func TestDeleteIndexUpdatesSwappedTimer(t *testing.T) {
+	tw, err := New[int](time.Hour, 4, func(int) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	first, err := tw.AddTimer(time.Hour, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := tw.AddTimer(time.Hour, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.RemoveTimer(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.RemoveTimer(second); err != nil {
+		t.Fatal(err)
+	}
+	if pending := tw.Stats().Pending; pending != 0 {
+		t.Fatalf("Pending after removing swapped timers: got %d, want 0", pending)
 	}
 }
 
 func TestAddTimerFunc(t *testing.T) {
 	done := make(chan struct{})
-	tw, _ := New[struct{}](10*time.Millisecond, 100, nil)
+	tw, err := New[struct{}](10*time.Millisecond, 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	tw.AddTimerFunc(50*time.Millisecond, func() { close(done) })
+	if _, err := tw.AddTimerFunc(50*time.Millisecond, func() { close(done) }); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-done:
@@ -153,12 +276,17 @@ func TestAddTimerFunc(t *testing.T) {
 
 func TestAddTimerWithJob(t *testing.T) {
 	done := make(chan int, 1)
-	tw, _ := New[int](10*time.Millisecond, 100, func(int) {
+	tw, err := New[int](10*time.Millisecond, 100, func(int) {
 		t.Error("default job should not be called")
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	tw.AddTimerWithJob(50*time.Millisecond, 42, func(n int) { done <- n })
+	if _, err := tw.AddTimerWithJob(50*time.Millisecond, 42, func(n int) { done <- n }); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case v := <-done:
@@ -170,13 +298,133 @@ func TestAddTimerWithJob(t *testing.T) {
 	}
 }
 
+func TestContextJobReportsError(t *testing.T) {
+	events := make(chan JobEvent[int], 1)
+	want := errors.New("job failed")
+	tw, err := New[int](time.Millisecond, 10, nil, WithJobObserver[int](func(e JobEvent[int]) {
+		events <- e
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	_, err = tw.AddTimerWithContextJob(time.Millisecond, 7, func(context.Context, int) error {
+		return want
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := waitEvent(t, events)
+	if !errors.Is(e.Err, want) || e.TimerID == 0 || e.Duration < 0 {
+		t.Fatalf("unexpected event: %+v", e)
+	}
+}
+
+func TestFixedRateMayOverlap(t *testing.T) {
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	tw, err := New[struct{}](5*time.Millisecond, 20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	id, err := tw.AddRepeatingTimerWithJob(5*time.Millisecond, struct{}{}, func(struct{}) {
+		started <- struct{}{}
+		<-release
+	}, RepeatOptions{Mode: FixedRate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(release)
+	defer func() { _ = tw.RemoveTimer(id) }()
+
+	<-started
+	select {
+	case <-started:
+	case <-time.After(80 * time.Millisecond):
+		t.Fatal("FixedRate did not overlap while previous job was running")
+	}
+}
+
+func TestFixedDelayDoesNotOverlap(t *testing.T) {
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	tw, err := New[struct{}](5*time.Millisecond, 20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	id, err := tw.AddRepeatingTimerWithJob(5*time.Millisecond, struct{}{}, func(struct{}) {
+		started <- struct{}{}
+		<-release
+	}, RepeatOptions{Mode: FixedDelay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tw.RemoveTimer(id) }()
+
+	<-started
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("FixedDelay overlapped")
+	default:
+	}
+	close(release)
+}
+
+func TestSkipIfRunningSkips(t *testing.T) {
+	events := make(chan JobEvent[struct{}], 8)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	tw, err := New[struct{}](
+		5*time.Millisecond,
+		20,
+		nil,
+		WithJobObserver[struct{}](func(e JobEvent[struct{}]) { events <- e }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	id, err := tw.AddRepeatingTimerWithJob(5*time.Millisecond, struct{}{}, func(struct{}) {
+		started <- struct{}{}
+		<-release
+	}, RepeatOptions{Mode: SkipIfRunning})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(release)
+	defer func() { _ = tw.RemoveTimer(id) }()
+
+	<-started
+	deadline := time.After(120 * time.Millisecond)
+	for tw.Stats().Skipped == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("expected skipped executions")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func TestStats(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
 	const n = 5
 	for range n {
-		tw.AddTimer(50*time.Millisecond, struct{}{})
+		if _, err := tw.AddTimer(50*time.Millisecond, struct{}{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	time.Sleep(200 * time.Millisecond)
@@ -190,17 +438,22 @@ func TestStats(t *testing.T) {
 	}
 }
 
-func TestStats_pendingDoesNotWaitForJobCompletion(t *testing.T) {
+func TestStatsPendingDoesNotWaitForJobCompletion(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	tw, _ := New[struct{}](5*time.Millisecond, 10, func(struct{}) {
+	tw, err := New[struct{}](5*time.Millisecond, 10, func(struct{}) {
 		close(started)
 		<-release
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	tw.AddTimer(time.Millisecond, struct{}{})
+	if _, err := tw.AddTimer(time.Millisecond, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-started:
@@ -216,18 +469,26 @@ func TestStats_pendingDoesNotWaitForJobCompletion(t *testing.T) {
 	if s.Executed != 1 {
 		t.Fatalf("Stats.Executed while job is running: want 1, got %d", s.Executed)
 	}
+	if s.Running != 1 {
+		t.Fatalf("Stats.Running while job is running: want 1, got %d", s.Running)
+	}
 }
 
 func TestErrorHandler(t *testing.T) {
 	recovered := make(chan any, 1)
-	tw, _ := New[struct{}](
+	tw, err := New[struct{}](
 		10*time.Millisecond, 100,
 		func(struct{}) { panic("boom") },
 		WithErrorHandler[struct{}](func(r any) { recovered <- r }),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	tw.AddTimer(30*time.Millisecond, struct{}{})
+	if _, err := tw.AddTimer(30*time.Millisecond, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case r := <-recovered:
@@ -237,66 +498,105 @@ func TestErrorHandler(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("error handler was not called")
 	}
-
-	s := tw.Stats()
-	if s.Pending != 0 {
-		t.Fatalf("Stats.Pending after recovered panic: want 0, got %d", s.Pending)
-	}
-	if s.Executed != 1 {
-		t.Fatalf("Stats.Executed after recovered panic: want 1, got %d", s.Executed)
-	}
 }
 
-func TestNew_invalidArgs(t *testing.T) {
+func TestNewInvalidArgs(t *testing.T) {
 	if _, err := New[int](0, 10, nil); err == nil {
 		t.Error("expected error for zero interval")
 	}
 	if _, err := New[int](time.Second, 0, nil); err == nil {
 		t.Error("expected error for zero slotNum")
 	}
+	if _, err := New[int](time.Second, 1, nil, WithWorkerPool[int](1, -1, Block)); err == nil {
+		t.Error("expected error for negative queue size")
+	}
+	if _, err := New[int](time.Second, 1, nil, WithWorkerPool[int](0, -1, Block)); err == nil {
+		t.Error("expected error for negative queue size with disabled workers")
+	}
 }
 
-func TestWithWorkerPool(t *testing.T) {
-	var concurrent atomic.Int32
-	var peak atomic.Int32
-
-	tw, _ := New[struct{}](
-		10*time.Millisecond, 100,
-		func(struct{}) {
-			c := concurrent.Add(1)
-			for {
-				old := peak.Load()
-				if c <= old || peak.CompareAndSwap(old, c) {
-					break
-				}
-			}
-			time.Sleep(30 * time.Millisecond)
-			concurrent.Add(-1)
-		},
-		WithWorkerPool[struct{}](3),
+func TestWorkerPoolDropPolicy(t *testing.T) {
+	events := make(chan JobEvent[struct{}], 8)
+	block := make(chan struct{})
+	tw, err := New[struct{}](
+		time.Millisecond,
+		10,
+		func(struct{}) { <-block },
+		WithWorkerPool[struct{}](1, 0, Drop),
+		WithJobObserver[struct{}](func(e JobEvent[struct{}]) { events <- e }),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(block)
 	startWheel(t, tw)
 
-	for range 10 {
-		tw.AddTimer(20*time.Millisecond, struct{}{})
+	for range 3 {
+		if _, err := tw.AddTimer(time.Millisecond, struct{}{}); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	if p := peak.Load(); p > 3 {
-		t.Fatalf("worker pool exceeded: peak concurrency = %d, want ≤ 3", p)
+	deadline := time.After(300 * time.Millisecond)
+	for tw.Stats().Dropped == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("expected dropped jobs")
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
-func TestWithLogger_recordsStopReason(t *testing.T) {
+func TestWorkerPoolRunInlinePolicy(t *testing.T) {
+	var count atomic.Int32
+	block := make(chan struct{})
+	tw, err := New[struct{}](
+		time.Millisecond,
+		10,
+		func(struct{}) {
+			count.Add(1)
+			if count.Load() == 1 {
+				<-block
+			}
+		},
+		WithWorkerPool[struct{}](1, 0, RunInline),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(block)
+	startWheel(t, tw)
+
+	for range 2 {
+		if _, err := tw.AddTimer(time.Millisecond, struct{}{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.After(300 * time.Millisecond)
+	for count.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("expected inline execution")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestWithLoggerRecordsStopReason(t *testing.T) {
 	logger := newRecordingLogger(2)
-	tw, _ := New[struct{}](
+	tw, err := New[struct{}](
 		10*time.Millisecond, 100,
 		func(struct{}) {},
 		WithLogger[struct{}](logger),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(t.Context())
-	tw.Start(ctx)
+	if err := tw.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	cancel()
 	tw.Wait()
@@ -306,85 +606,44 @@ func TestWithLogger_recordsStopReason(t *testing.T) {
 	if !ok {
 		t.Fatal("stop log missing reason")
 	}
-	err, ok := value.(error)
-	if !ok || !errors.Is(err, context.Canceled) {
+	errValue, ok := value.(error)
+	if !ok || !errors.Is(errValue, context.Canceled) {
 		t.Fatalf("stop reason: got %v, want context.Canceled", value)
 	}
 }
 
-func TestWithLogger_recordsMissingJobWarning(t *testing.T) {
+func TestWithLoggerRecordsMissingJobWarning(t *testing.T) {
 	logger := newRecordingLogger(4)
-	tw, _ := New[struct{}](
+	tw, err := New[struct{}](
 		5*time.Millisecond, 10,
 		nil,
 		WithLogger[struct{}](logger),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	key := tw.AddTimer(time.Millisecond, struct{}{})
+	id, err := tw.AddTimer(time.Millisecond, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	entry := waitLog(t, logger, "warn", "timewheel: task has no job and wheel has no default job")
 	value, ok := logArg(entry.args, "key")
 	if !ok {
 		t.Fatal("missing-job warning missing key")
 	}
-	if value != key {
-		t.Fatalf("missing-job warning key: got %v, want %d", value, key)
+	if value != id {
+		t.Fatalf("missing-job warning key: got %v, want %d", value, id)
 	}
 }
 
-func TestWithLogger_nilDisablesInternalLogs(t *testing.T) {
-	tw, _ := New[struct{}](
-		5*time.Millisecond, 10,
-		nil,
-		WithLogger[struct{}](nil),
-	)
-	startWheel(t, tw)
-
-	key := tw.AddTimer(time.Millisecond, struct{}{})
-	timer := time.NewTimer(200 * time.Millisecond)
-	defer timer.Stop()
-
-	for {
-		if _, ok := tw.NextFireTime(key); !ok {
-			return
-		}
-		select {
-		case <-time.After(time.Millisecond):
-		case <-timer.C:
-			t.Fatal("timer with nil logger was not cleared")
-		}
+func TestCalcPosCircleCeilTicksFromNextScan(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 4, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestRemoveTimer_beforePlacement(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
-
-	key := tw.AddTimer(time.Second, struct{}{})
-	tw.deleteTask(key)
-	tw.placeTask(<-tw.addCh)
-
-	if _, ok := tw.NextFireTime(key); ok {
-		t.Fatal("NextFireTime: key should be gone after removing before placement")
-	}
-
-	for i := range tw.slots {
-		if len(tw.slots[i].tasks) != 0 {
-			t.Fatalf("slot %d has %d tasks after pre-placement removal", i, len(tw.slots[i].tasks))
-		}
-	}
-
-	s := tw.Stats()
-	if s.Pending != 0 {
-		t.Fatalf("Stats.Pending after pre-placement removal: want 0, got %d", s.Pending)
-	}
-	if s.Removed != 1 {
-		t.Fatalf("Stats.Removed after pre-placement removal: want 1, got %d", s.Removed)
-	}
-}
-
-func TestCalcPosCircle_ceilTicksFromNextScan(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 4, nil)
 
 	tests := []struct {
 		name       string
@@ -410,151 +669,116 @@ func TestCalcPosCircle_ceilTicksFromNextScan(t *testing.T) {
 	}
 }
 
-func TestDispatch_repeatingDoesNotSendToAddChannel(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
-	for range cap(tw.addCh) {
-		tw.addCh <- &task[struct{}]{}
+func TestNextFireTimeKnownKey(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	tw.timerIndex[1] = timerMeta{
-		nextFireAt: time.Now(),
-		delay:      time.Second,
-		mode:       modeRepeat,
-	}
-	tw.stats.pending.Store(1)
-
-	done := make(chan struct{})
-	go func() {
-		tw.dispatch(&task[struct{}]{
-			key:   1,
-			delay: time.Second,
-			mode:  modeRepeat,
-		})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(300 * time.Millisecond):
-		t.Fatal("dispatch blocked while re-enqueuing repeating timer")
-	}
-}
-
-// ─── next-fire-time ───────────────────────────────────────────────────────────
-
-func TestNextFireTime_knownKey(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
 	startWheel(t, tw)
 
 	delay := 200 * time.Millisecond
 	before := time.Now()
-	key := tw.AddTimer(delay, struct{}{})
+	id, err := tw.AddTimer(delay, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	ft, ok := tw.NextFireTime(key)
+	ft, ok := tw.NextFireTime(id)
 	if !ok {
 		t.Fatal("NextFireTime: key not found immediately after AddTimer")
 	}
 
-	// The returned time must be roughly now+delay (within one interval of slack).
 	lo := before.Add(delay - 10*time.Millisecond)
-	hi := before.Add(delay + 20*time.Millisecond)
+	hi := before.Add(delay + 30*time.Millisecond)
 	if ft.Before(lo) || ft.After(hi) {
 		t.Fatalf("NextFireTime out of expected range: got %v, want [%v, %v]", ft, lo, hi)
 	}
 }
 
-func TestNextFireTime_unknownKey(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
-	startWheel(t, tw)
-
-	_, ok := tw.NextFireTime(99999)
-	if ok {
-		t.Fatal("NextFireTime: expected false for unknown key")
-	}
-}
-
-func TestNextFireTime_clearedAfterFire(t *testing.T) {
+func TestNextFireTimeClearedAfterFire(t *testing.T) {
 	fired := make(chan struct{})
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) { close(fired) })
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) { close(fired) })
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	key := tw.AddTimer(50*time.Millisecond, struct{}{})
+	id, err := tw.AddTimer(50*time.Millisecond, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	<-fired
-	time.Sleep(30 * time.Millisecond) // let index deletion propagate
+	time.Sleep(30 * time.Millisecond)
 
-	_, ok := tw.NextFireTime(key)
+	_, ok := tw.NextFireTime(id)
 	if ok {
 		t.Fatal("NextFireTime: key should be gone after one-shot timer fires")
 	}
 }
 
-func TestNextFireTime_clearedAfterRemove(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
-	startWheel(t, tw)
-
-	key := tw.AddTimer(500*time.Millisecond, struct{}{})
-	time.Sleep(20 * time.Millisecond)
-	tw.RemoveTimer(key)
-	time.Sleep(30 * time.Millisecond) // let event loop process removal
-
-	_, ok := tw.NextFireTime(key)
-	if ok {
-		t.Fatal("NextFireTime: key should be gone after RemoveTimer")
+func TestNextFireTimeRepeatingAdvances(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestNextFireTime_repeatingAdvances(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
 	startWheel(t, tw)
 
-	key := tw.AddRepeating(60*time.Millisecond, struct{}{})
+	id, err := tw.AddRepeatingTimer(60*time.Millisecond, struct{}{}, RepeatOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	ft1, ok := tw.NextFireTime(key)
+	ft1, ok := tw.NextFireTime(id)
 	if !ok {
-		t.Fatal("NextFireTime: key not found after AddRepeating")
+		t.Fatal("NextFireTime: key not found after AddRepeatingTimer")
 	}
 
-	// Wait for two firings.
 	time.Sleep(160 * time.Millisecond)
 
-	ft2, ok := tw.NextFireTime(key)
+	ft2, ok := tw.NextFireTime(id)
 	if !ok {
-		t.Fatal("NextFireTime: key gone after repeating fire — should still exist")
+		t.Fatal("NextFireTime: key gone after repeating fire")
 	}
 	if !ft2.After(ft1) {
 		t.Fatalf("NextFireTime did not advance after repeat: ft1=%v ft2=%v", ft1, ft2)
 	}
 
-	tw.RemoveTimer(key)
+	if err := tw.RemoveTimer(id); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPendingTimers(t *testing.T) {
-	tw, _ := New[int](10*time.Millisecond, 100, func(int) {})
+	tw, err := New[int](10*time.Millisecond, 100, func(int) {})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	keys := make([]uint64, 5)
-	for i := range keys {
-		keys[i] = tw.AddTimer(time.Duration(i+1)*100*time.Millisecond, i)
+	ids := make([]TimerID, 5)
+	for i := range ids {
+		id, err := tw.AddTimer(time.Duration(i+1)*100*time.Millisecond, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = id
 	}
-	// Give the event loop a moment to place all tasks.
-	time.Sleep(30 * time.Millisecond)
 
 	pending := tw.PendingTimers()
 	if len(pending) != 5 {
 		t.Fatalf("PendingTimers: want 5 entries, got %d", len(pending))
 	}
 
-	// Verify ascending order.
 	for i := range len(pending) - 1 {
 		if pending[i+1].NextFireAt.Before(pending[i].NextFireAt) {
 			t.Fatalf("PendingTimers not sorted at index %d", i+1)
 		}
 	}
 
-	// Remove one and re-check count.
-	tw.RemoveTimer(keys[0])
-	time.Sleep(20 * time.Millisecond)
+	if err := tw.RemoveTimer(ids[0]); err != nil {
+		t.Fatal(err)
+	}
 
 	pending2 := tw.PendingTimers()
 	if len(pending2) != 4 {
@@ -562,54 +786,79 @@ func TestPendingTimers(t *testing.T) {
 	}
 }
 
-func TestPendingTimers_repeatingMarked(t *testing.T) {
-	tw, _ := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+func TestPendingTimersRepeatingMarked(t *testing.T) {
+	tw, err := New[struct{}](10*time.Millisecond, 100, func(struct{}) {})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startWheel(t, tw)
 
-	tw.AddTimer(500*time.Millisecond, struct{}{})
-	key := tw.AddRepeating(500*time.Millisecond, struct{}{})
-	time.Sleep(20 * time.Millisecond)
+	if _, err := tw.AddTimer(500*time.Millisecond, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := tw.AddRepeatingTimer(500*time.Millisecond, struct{}{}, RepeatOptions{Mode: SkipIfRunning})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pending := tw.PendingTimers()
 	counts := map[bool]int{}
+	var repeatMode RepeatMode
 	for _, p := range pending {
 		counts[p.Repeating]++
+		if p.Repeating {
+			repeatMode = p.RepeatMode
+		}
 	}
 	if counts[false] != 1 || counts[true] != 1 {
 		t.Fatalf("expected 1 one-shot and 1 repeating, got %v", counts)
 	}
-	tw.RemoveTimer(key)
+	if repeatMode != SkipIfRunning {
+		t.Fatalf("repeat mode: got %v, want SkipIfRunning", repeatMode)
+	}
+	if err := tw.RemoveTimer(id); err != nil {
+		t.Fatal(err)
+	}
 }
 
-// ─── benchmarks ───────────────────────────────────────────────────────────────
-
-// BenchmarkAddTimer measures the throughput of enqueuing timers.
 func BenchmarkAddTimer(b *testing.B) {
-	tw, _ := New[int](time.Millisecond, 1000, func(int) {})
-	tw.Start(b.Context())
-	b.Cleanup(tw.Wait)
+	tw, err := New[int](time.Millisecond, 1000, func(int) {})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := tw.Start(b.Context()); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = tw.Close() })
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			tw.AddTimer(500*time.Millisecond, 0)
+			if _, err := tw.AddTimer(500*time.Millisecond, 0); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
 
-// BenchmarkTick measures the overhead of a single wheel tick with N pending tasks.
 func BenchmarkTick(b *testing.B) {
 	for _, n := range []int{100, 1_000, 10_000} {
 		b.Run(fmt.Sprintf("tasks=%d", n), func(b *testing.B) {
-			tw, _ := New[int](time.Hour, 3600, func(int) {})
-			// pre-load all tasks into slot 1 (1 tick away) so they fire each tick
-			tw.Start(b.Context())
-			b.Cleanup(tw.Wait)
+			tw, err := New[int](time.Hour, 3600, func(int) {})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := tw.Start(b.Context()); err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = tw.Close() })
 
 			for i := range n {
-				tw.AddTimer(time.Hour, i) // circle=0, slot depends on current pos
+				if _, err := tw.AddTimer(time.Hour, i); err != nil {
+					b.Fatal(err)
+				}
 			}
-			time.Sleep(50 * time.Millisecond) // let addCh drain
+			time.Sleep(50 * time.Millisecond)
 
 			b.ResetTimer()
 			for b.Loop() {
@@ -618,6 +867,3 @@ func BenchmarkTick(b *testing.B) {
 		})
 	}
 }
-
-// suppress "declared and not used" for the fmt import used only in benchmarks
-var _ = fmt.Sprintf

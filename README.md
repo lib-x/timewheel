@@ -1,20 +1,9 @@
 # timewheel
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/lib-x/timewheel.svg)](https://pkg.go.dev/github.com/lib-x/timewheel)
+[![Go Reference](https://pkg.go.dev/badge/github.com/lib-x/timewheel/v2.svg)](https://pkg.go.dev/github.com/lib-x/timewheel/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/lib-x/timewheel)](https://goreportcard.com/report/github.com/lib-x/timewheel)
 
-A generic, high-performance timer wheel for Go 1.25+.
-
-## Features
-
-- **Generics** — the payload type `T` is a type parameter; no `interface{}` assertions needed
-- **Context-aware lifecycle** — the wheel stops cleanly when the supplied `context.Context` is cancelled
-- **Multiple timer modes** — one-shot, repeating, and bare-closure (`AddTimerFunc`) variants
-- **Bounded worker pool** — optionally cap concurrent job goroutines with `WithWorkerPool`
-- **Panic recovery** — optionally recover job panics via `WithErrorHandler`
-- **Logger abstraction** — optionally pass any logger with `Info` / `Warn` methods; no logging package is imported by timewheel
-- **Runtime stats** — query pending / executed / removed counters at any time via `Stats()`
-- **Low allocation hot path** — `sync.Pool` recycles task objects; slots use slice swap-deletion (O(1), no heap pressure)
+A generic timer wheel for Go.
 
 ## Requirements
 
@@ -23,10 +12,10 @@ Go 1.25 or later.
 ## Installation
 
 ```bash
-go get github.com/lib-x/timewheel
+go get github.com/lib-x/timewheel/v2
 ```
 
-## Quick start
+## Quick Start
 
 ```go
 package main
@@ -37,17 +26,14 @@ import (
     "log"
     "time"
 
-    "github.com/lib-x/timewheel"
+    "github.com/lib-x/timewheel/v2"
 )
 
 func main() {
-    // Create a wheel that ticks every 100 ms across 60 slots.
-    // Maximum single-rotation range: 100ms × 60 = 6 s.
-    // Delays beyond that are handled transparently via circle counting.
     tw, err := timewheel.New[string](
-        100*time.Millisecond, // tick interval (resolution)
-        60,                   // number of slots
-        func(msg string) {    // default job
+        100*time.Millisecond,
+        60,
+        func(msg string) {
             fmt.Println("fired:", msg)
         },
     )
@@ -58,17 +44,19 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    tw.Start(ctx)
+    if err := tw.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+    defer tw.Close()
 
-    key := tw.AddTimer(500*time.Millisecond, "hello")
-    tw.AddTimer(1*time.Second, "world")
-
-    // Inspect the scheduled fire time immediately after registration.
-    if fireAt, ok := tw.NextFireTime(key); ok {
-        fmt.Printf("'hello' fires in %s\n", time.Until(fireAt).Round(time.Millisecond))
+    id, err := tw.AddTimer(500*time.Millisecond, "hello")
+    if err != nil {
+        log.Fatal(err)
     }
 
-    time.Sleep(2 * time.Second)
+    if fireAt, ok := tw.NextFireTime(id); ok {
+        fmt.Printf("'hello' fires in %s\n", time.Until(fireAt).Round(time.Millisecond))
+    }
 }
 ```
 
@@ -85,160 +73,214 @@ func New[T any](
 ) (*TimeWheel[T], error)
 ```
 
-| Parameter | Description |
-|-----------|-------------|
-| `interval` | Tick resolution. The minimum timer precision equals `interval`. |
-| `slotNum` | Number of slots. A larger value spreads tasks across more buckets and reduces per-tick scan work. |
-| `defaultJob` | Callback used when a task has no per-task job. May be `nil` if every timer is registered via `AddTimerWithJob`. |
-
-### Options
-
-```go
-type Logger interface {
-    Info(msg string, args ...any)
-    Warn(msg string, args ...any)
-}
-```
-
-| Option | Description |
-|--------|-------------|
-| `WithWorkerPool[T](n int)` | Limit concurrent job goroutines to `n`. |
-| `WithErrorHandler[T](fn)` | Called with the recovered value whenever a job panics. |
-| `WithLogger[T](l Logger)` | Use this logger for internal diagnostics. If omitted or nil, timewheel does not log. |
-
-`WithLogger` accepts any concrete logger or adapter that implements the small interface above, including `*slog.Logger`. The package itself does not import `log/slog`, zap, zerolog, or any other logging implementation.
+`interval` is the tick resolution. Delays shorter than one interval are rounded
+up to one tick. `slotNum` controls how many buckets the wheel uses before circle
+counting handles longer delays.
 
 ### Lifecycle
 
 ```go
-tw.Start(ctx)  // launch event loop; stops when ctx is cancelled
-tw.Wait()      // block until the event loop exits
+func (tw *TimeWheel[T]) Start(ctx context.Context) error
+func (tw *TimeWheel[T]) Stop() error
+func (tw *TimeWheel[T]) Close() error
+func (tw *TimeWheel[T]) Wait()
 ```
 
-### Timer registration
+Lifecycle is explicit:
 
-| Method | Description |
-|--------|-------------|
-| `AddTimer(delay, data) uint64` | One-shot timer using the default job. |
-| `AddTimerWithJob(delay, data, job) uint64` | One-shot timer with a per-task job. |
-| `AddTimerFunc(delay, fn) uint64` | One-shot timer from a plain closure (no payload required). |
-| `AddRepeating(delay, data) uint64` | Recurring timer using the default job. |
-| `AddRepeatingWithJob(delay, data, job) uint64` | Recurring timer with a per-task job. |
-| `RemoveTimer(key uint64)` | Cancel a pending timer. No-op for unknown or already-fired keys. |
+```text
+new -> running -> closed
+```
 
-All registration methods return a `uint64` key that uniquely identifies the timer within the wheel's lifetime.
+- `Start(nil)` returns `ErrNilContext`.
+- `Start` may succeed once.
+- Starting an already running wheel returns `ErrRunning`.
+- Starting a closed wheel returns `ErrClosed`.
+- `Stop` before `Start` returns `ErrNotStarted`.
+- `Stop` is idempotent after the wheel is running or closed.
+- `Close` is idempotent, stops the wheel, and waits for the event loop and worker pool.
+- Canceling the context passed to `Start` stops the wheel.
 
-### Inspecting next fire time
+Timer registration requires a running wheel. `Add*` and `RemoveTimer` return
+`ErrNotStarted` before `Start` and `ErrClosed` after shutdown begins.
+
+### Timer IDs
 
 ```go
-key := tw.AddTimer(5*time.Second, "payload")
-
-// Query a single timer — O(1), no slot lock acquired.
-if fireAt, ok := tw.NextFireTime(key); ok {
-    fmt.Println("fires at:", fireAt)
-    fmt.Println("in:      ", time.Until(fireAt).Round(time.Millisecond))
-}
-
-// List all pending timers, sorted by ascending fire time.
-for _, info := range tw.PendingTimers() {
-    fmt.Printf("key=%-6d  repeating=%-5v  next=%s  in=%s\n",
-        info.Key,
-        info.Repeating,
-        info.NextFireAt.Format(time.TimeOnly),
-        time.Until(info.NextFireAt).Round(time.Millisecond),
-    )
-}
+type TimerID uint64
 ```
 
-`NextFireTime` returns `(zero, false)` when the key does not exist — either because it was never registered, has already fired (one-shot), or was explicitly removed. For repeating timers the returned time advances after every execution.
+All timer APIs use `TimerID` instead of raw integers.
 
-`PendingTimers` returns a freshly allocated `[]TimerInfo` snapshot. Each entry carries:
+### One-Shot Timers
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `Key` | `uint64` | Timer identifier |
-| `NextFireAt` | `time.Time` | Expected wall-clock fire time |
-| `Delay` | `time.Duration` | Original registration delay |
-| `Repeating` | `bool` | True for `AddRepeating` / `AddRepeatingWithJob` timers |
+```go
+type Job[T any] func(T)
+type JobContext[T any] func(context.Context, T) error
+
+func (tw *TimeWheel[T]) AddTimer(delay time.Duration, data T) (TimerID, error)
+func (tw *TimeWheel[T]) AddTimerWithJob(delay time.Duration, data T, job Job[T]) (TimerID, error)
+func (tw *TimeWheel[T]) AddTimerWithContextJob(delay time.Duration, data T, job JobContext[T]) (TimerID, error)
+func (tw *TimeWheel[T]) AddTimerFunc(delay time.Duration, fn func()) (TimerID, error)
+```
+
+Nil per-timer jobs return `ErrNilJob`. A nil default job is allowed only when
+timers provide their own job. If a timer fires without any job, the wheel logs
+a warning when a logger is configured and removes the timer.
+
+### Repeating Timers
+
+```go
+type RepeatMode uint8
+
+const (
+    FixedRate RepeatMode = iota
+    FixedDelay
+    SkipIfRunning
+)
+
+type RepeatOptions struct {
+    Mode RepeatMode
+}
+
+func (tw *TimeWheel[T]) AddRepeatingTimer(delay time.Duration, data T, opts RepeatOptions) (TimerID, error)
+func (tw *TimeWheel[T]) AddRepeatingTimerWithJob(delay time.Duration, data T, job Job[T], opts RepeatOptions) (TimerID, error)
+func (tw *TimeWheel[T]) AddRepeatingTimerWithContextJob(delay time.Duration, data T, job JobContext[T], opts RepeatOptions) (TimerID, error)
+```
+
+Repeat modes:
+
+- `FixedRate`: schedules the next fire when the current fire is dispatched. Jobs may overlap.
+- `FixedDelay`: waits for the previous job to return, then waits the delay. Jobs do not overlap.
+- `SkipIfRunning`: keeps a fixed-rate cadence but skips a fire if the previous job is still running.
+
+The zero-value `RepeatOptions{}` uses `FixedRate`.
+
+### Removing Timers
+
+```go
+func (tw *TimeWheel[T]) RemoveTimer(id TimerID) error
+```
+
+Unknown, already-fired, and already-removed timer IDs are successful no-ops.
+After `RemoveTimer` returns nil, the wheel will not dispatch any future
+not-yet-started execution for that timer.
+
+`RemoveTimer` does not cancel a job that has already started. Use
+`JobContext` if a job needs to observe root wheel shutdown.
 
 ### Observability
 
 ```go
-s := tw.Stats()
-fmt.Println(s.Pending)  // tasks currently in the wheel
-fmt.Println(s.Executed) // total tasks dispatched since Start
-fmt.Println(s.Removed)  // total tasks cancelled via RemoveTimer
+type JobEvent[T any] struct {
+    TimerID      TimerID
+    Data         T
+    StartedAt    time.Time
+    FinishedAt   time.Time
+    ScheduledFor time.Time
+    Lateness     time.Duration
+    Duration     time.Duration
+    Err          error
+    Panic        any
+    Dropped      bool
+    Skipped      bool
+}
+
+type JobObserver[T any] func(JobEvent[T])
+
+func WithJobObserver[T any](observer JobObserver[T]) Option[T]
+func WithErrorHandler[T any](h func(recovered any)) Option[T]
+func WithLogger[T any](l Logger) Option[T]
 ```
 
-## Design notes
+`JobContext` errors are reported through `JobEvent.Err`. Panics are recovered
+when an error handler or observer is configured. Without either, a panic keeps
+normal Go behavior and crashes the program.
 
-### Time wheel basics
+### Worker Pool
 
+```go
+type BackpressurePolicy uint8
+
+const (
+    Block BackpressurePolicy = iota
+    Drop
+    RunInline
+)
+
+func WithWorkerPool[T any](workers int, queueSize int, policy BackpressurePolicy) Option[T]
 ```
-slots:  [ 0 ][ 1 ][ 2 ] ... [ N-1 ]
-                  ↑
-            currentPos
 
-Every interval:
-  1. Scan slot[currentPos]: decrement circle for tasks not yet due;
-     dispatch tasks whose circle == 0.
-  2. Advance currentPos = (currentPos + 1) % slotNum.
+`workers <= 0` disables the pool and runs jobs in independent goroutines.
+`queueSize` bounds the worker queue when the pool is enabled.
+
+Backpressure policies:
+
+- `Block`: wait for queue capacity unless shutdown starts.
+- `Drop`: record a dropped job and do not run it when the queue is full.
+- `RunInline`: run the job on the event loop when the queue is full.
+
+`RunInline` preserves execution but can delay ticks.
+
+### Stats
+
+```go
+type Stats struct {
+    Pending  int64
+    Executed int64
+    Removed  int64
+    Queued   int64
+    Running  int64
+    Dropped  int64
+    Skipped  int64
+}
 ```
 
-A task with delay `d` is placed at:
+`Pending` counts timers currently waiting in wheel slots. It does not count
+jobs waiting in the worker queue or jobs already running.
 
+### Inspecting Timers
+
+```go
+func (tw *TimeWheel[T]) NextFireTime(id TimerID) (time.Time, bool)
+func (tw *TimeWheel[T]) PendingTimers() []TimerInfo
+func (tw *TimeWheel[T]) Stats() Stats
 ```
-ticks  = ceil(d / interval)
-offset = ticks - 1             // currentPos is scanned on the next tick
-circle = offset / slotNum      // full rotations to wait
+
+`NextFireTime` and `PendingTimers` are snapshots. They are estimates based on
+the wheel state when queried, not hard real-time guarantees. Actual dispatch
+happens no earlier than the scheduled time and can be delayed by up to one tick
+plus runtime scheduling jitter.
+
+For `FixedDelay` timers, there is no pending next fire while the previous job is
+still running; the next fire is scheduled after that job returns.
+
+## Design Notes
+
+### Time Wheel Placement
+
+```text
+ticks  = ceil(delay / interval)
+offset = ticks - 1
+circle = offset / slotNum
 pos    = (currentPos + offset) % slotNum
 ```
 
-### Slot-level locking
+The event loop scans one slot on every tick, dispatches due tasks, then advances
+the wheel pointer.
 
-Each slot owns its own `sync.Mutex`. The event loop acquires a slot's lock only while placing or deleting tasks. Concurrent callers operating on different slots do not block one another.
+### Deletion Complexity
 
-### Object pooling
+The wheel keeps a `TimerID -> slot/index` location index. `RemoveTimer` uses the
+index to find the timer in O(1), then removes it from the slot with
+swap-and-shrink. When another task is swapped into the removed position, its
+index is updated immediately.
 
-`task` structs are allocated once and returned to a `sync.Pool` after use, keeping the hot path largely allocation-free and reducing GC pressure under high timer turnover.
+### Core Scope
 
-### Deletion
-
-`deleteTask` performs an O(1) swap-and-shrink: the target element is overwritten with the last element in the slice and the slice is shortened by one, avoiding the O(n) copy of `append(s[:i], s[i+1:]...)`.
-
-## Example: bounded worker pool + error recovery
-
-```go
-tw, _ := timewheel.New[[]byte](
-    50*time.Millisecond,
-    200,
-    processPayload,
-    timewheel.WithWorkerPool[[]byte](16),
-    timewheel.WithErrorHandler[[]byte](func(r any) {
-        slog.Error("job panicked", "err", r)
-    }),
-    timewheel.WithLogger[[]byte](slog.Default()),
-)
-
-ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-defer cancel()
-
-tw.Start(ctx)
-
-// Enqueue work
-tw.AddTimer(200*time.Millisecond, payload)
-
-tw.Wait()
-```
-
-## Example: repeating ticker with graceful stop
-
-```go
-key := tw.AddRepeating(1*time.Second, struct{}{})
-
-// ... later ...
-tw.RemoveTimer(key) // stops the repetition
-```
+The core package handles delay, repeat, cancel, execution, and inspection. Cron
+expressions, persistent scheduling, orchestration, and business-key mapping
+belong in separate packages layered on top.
 
 ## License
 

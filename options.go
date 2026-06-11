@@ -2,40 +2,65 @@ package timewheel
 
 type config[T any] struct {
 	workerNum    int
+	queueSize    int
+	backpressure BackpressurePolicy
 	errorHandler func(recovered any)
+	observer     JobObserver[T]
 	logger       Logger
+	clock        clock
 }
 
-// Option is a functional option for [New].
+// Option is a functional option for New.
 type Option[T any] func(*config[T])
 
 // Logger is the minimal logging interface used by TimeWheel.
-//
-// The package does not bind to any concrete logging implementation. Callers
-// may pass *slog.Logger directly or adapt zap, zerolog, or another logger.
-// If no logger is configured, TimeWheel does not emit internal logs.
 type Logger interface {
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
 }
 
-// WithWorkerPool limits the number of concurrently running job goroutines to n.
-// When n <= 0 the option is ignored and goroutines are spawned without bound.
-func WithWorkerPool[T any](n int) Option[T] {
+// BackpressurePolicy controls behavior when the bounded worker queue is full.
+type BackpressurePolicy uint8
+
+const (
+	// Block waits for queue capacity unless the wheel is shutting down.
+	Block BackpressurePolicy = iota
+
+	// Drop records a dropped job and does not run it when the queue is full.
+	Drop
+
+	// RunInline runs the job on the event loop when the queue is full.
+	RunInline
+)
+
+// WithWorkerPool configures a fixed worker pool and bounded queue.
+//
+// workers <= 0 disables the pool and runs each job in its own goroutine.
+func WithWorkerPool[T any](workers int, queueSize int, policy BackpressurePolicy) Option[T] {
 	return func(c *config[T]) {
-		if n > 0 {
-			c.workerNum = n
+		c.queueSize = queueSize
+		if workers > 0 {
+			c.workerNum = workers
+			c.backpressure = policy
 		}
 	}
 }
 
-// WithErrorHandler registers a function that is called with the recovered value
-// whenever a job panics. If not set, panics propagate and crash the program.
+// WithErrorHandler registers a function called with recovered job panics.
 func WithErrorHandler[T any](h func(recovered any)) Option[T] {
 	return func(c *config[T]) { c.errorHandler = h }
+}
+
+// WithJobObserver registers a function called for job execution, drop, and skip events.
+func WithJobObserver[T any](observer JobObserver[T]) Option[T] {
+	return func(c *config[T]) { c.observer = observer }
 }
 
 // WithLogger configures the logger used for internal diagnostic messages.
 func WithLogger[T any](l Logger) Option[T] {
 	return func(c *config[T]) { c.logger = l }
+}
+
+func withClock[T any](clk clock) Option[T] {
+	return func(c *config[T]) { c.clock = clk }
 }
