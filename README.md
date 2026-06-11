@@ -221,6 +221,8 @@ Backpressure policies:
 - `RunInline`: run the job on the event loop when the queue is full.
 
 `RunInline` preserves execution but can delay ticks.
+When a repeating execution is dropped, the timer remains active and schedules
+its next attempt according to its repeat mode.
 
 ### Stats
 

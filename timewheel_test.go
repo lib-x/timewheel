@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -547,6 +548,116 @@ func TestWorkerPoolDropPolicy(t *testing.T) {
 	}
 }
 
+func TestDropFixedDelayRepeatingRecovers(t *testing.T) {
+	blockStarted := make(chan struct{})
+	releaseBlocker := make(chan struct{})
+	var count atomic.Int32
+
+	tw, err := New[struct{}](
+		time.Millisecond,
+		10,
+		nil,
+		WithWorkerPool[struct{}](1, 0, Drop),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	if _, err := tw.AddTimerWithJob(time.Millisecond, struct{}{}, func(struct{}) {
+		close(blockStarted)
+		<-releaseBlocker
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-blockStarted
+
+	id, err := tw.AddRepeatingTimerWithJob(time.Millisecond, struct{}{}, func(struct{}) {
+		count.Add(1)
+	}, RepeatOptions{Mode: FixedDelay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tw.RemoveTimer(id) }()
+
+	deadline := time.After(300 * time.Millisecond)
+	for tw.Stats().Dropped == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("expected repeating execution to be dropped while worker is busy")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	close(releaseBlocker)
+
+	deadline = time.After(300 * time.Millisecond)
+	for count.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("fixed-delay repeating timer never recovered after dropped execution")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestDropSkipIfRunningRepeatingRecovers(t *testing.T) {
+	blockStarted := make(chan struct{})
+	releaseBlocker := make(chan struct{})
+	var count atomic.Int32
+
+	tw, err := New[struct{}](
+		time.Millisecond,
+		10,
+		nil,
+		WithWorkerPool[struct{}](1, 0, Drop),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWheel(t, tw)
+
+	if _, err := tw.AddTimerWithJob(time.Millisecond, struct{}{}, func(struct{}) {
+		close(blockStarted)
+		<-releaseBlocker
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-blockStarted
+
+	id, err := tw.AddRepeatingTimerWithJob(time.Millisecond, struct{}{}, func(struct{}) {
+		count.Add(1)
+	}, RepeatOptions{Mode: SkipIfRunning})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tw.RemoveTimer(id) }()
+
+	deadline := time.After(300 * time.Millisecond)
+	for tw.Stats().Dropped == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("expected repeating execution to be dropped while worker is busy")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	close(releaseBlocker)
+
+	deadline = time.After(300 * time.Millisecond)
+	for count.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("skip-if-running repeating timer never recovered after dropped execution")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func TestWorkerPoolRunInlinePolicy(t *testing.T) {
 	var count atomic.Int32
 	block := make(chan struct{})
@@ -580,6 +691,69 @@ func TestWorkerPoolRunInlinePolicy(t *testing.T) {
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+func TestRunInlineFixedDelayDoesNotDeadlockWhenCommandChannelIsFull(t *testing.T) {
+	workerStarted := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	inlineStarted := make(chan struct{})
+	releaseInline := make(chan struct{})
+	var inlineOnce sync.Once
+
+	tw, err := New[struct{}](
+		time.Millisecond,
+		10,
+		nil,
+		WithWorkerPool[struct{}](1, 0, RunInline),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tw.AddTimerWithJob(time.Millisecond, struct{}{}, func(struct{}) {
+		close(workerStarted)
+		<-releaseWorker
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-workerStarted
+
+	if _, err := tw.AddRepeatingTimerWithJob(time.Millisecond, struct{}{}, func(struct{}) {
+		inlineOnce.Do(func() { close(inlineStarted) })
+		<-releaseInline
+	}, RepeatOptions{Mode: FixedDelay}); err != nil {
+		t.Fatal(err)
+	}
+	<-inlineStarted
+
+	addDone := make(chan struct{}, cap(tw.commandCh))
+	for range cap(tw.commandCh) {
+		go func() {
+			_, _ = tw.AddTimer(time.Hour, struct{}{})
+			addDone <- struct{}{}
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	close(releaseInline)
+	close(releaseWorker)
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- tw.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Close did not return after inline fixed-delay job completed")
 	}
 }
 

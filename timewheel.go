@@ -185,6 +185,14 @@ type workItem[T any] struct {
 	scheduledFor time.Time
 }
 
+type executeResult uint8
+
+const (
+	executeAccepted executeResult = iota
+	executeDropped
+	executeCanceled
+)
+
 // TimeWheel is a generic timer wheel.
 //
 // Use New to construct a wheel, Start to run it, and Close to stop and wait.
@@ -669,7 +677,13 @@ func (tw *TimeWheel[T]) dispatchRepeating(t *task[T], item workItem[T]) {
 	switch t.repeatMode {
 	case FixedDelay:
 		tw.markRunning(t.key, true)
-		tw.execute(item)
+		result := tw.execute(item)
+		if result != executeAccepted {
+			tw.markRunning(t.key, false)
+			if result == executeDropped {
+				tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+			}
+		}
 	case SkipIfRunning:
 		if tw.isRunning(t.key) {
 			tw.stats.skipped.Add(1)
@@ -683,18 +697,27 @@ func (tw *TimeWheel[T]) dispatchRepeating(t *task[T], item workItem[T]) {
 			return
 		}
 		tw.markRunning(t.key, true)
-		tw.execute(item)
-		tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+		result := tw.execute(item)
+		if result == executeAccepted {
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+			return
+		}
+		tw.markRunning(t.key, false)
+		if result == executeDropped {
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, t.repeatMode)
+		}
 	default:
-		tw.execute(item)
-		tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, FixedRate)
+		result := tw.execute(item)
+		if result != executeCanceled {
+			tw.reenqueue(t.key, t.delay, t.data, t.job, t.contextJob, FixedRate)
+		}
 	}
 }
 
-func (tw *TimeWheel[T]) execute(item workItem[T]) {
+func (tw *TimeWheel[T]) execute(item workItem[T]) executeResult {
 	if tw.workCh == nil {
-		go tw.runJob(item)
-		return
+		go tw.runJob(item, false)
+		return executeAccepted
 	}
 
 	switch tw.cfg.backpressure {
@@ -702,6 +725,7 @@ func (tw *TimeWheel[T]) execute(item workItem[T]) {
 		tw.stats.queued.Add(1)
 		select {
 		case tw.workCh <- item:
+			return executeAccepted
 		default:
 			tw.stats.queued.Add(-1)
 			tw.stats.dropped.Add(1)
@@ -712,21 +736,26 @@ func (tw *TimeWheel[T]) execute(item workItem[T]) {
 				Dropped:      true,
 				Err:          ErrQueueFull,
 			})
+			return executeDropped
 		}
 	case RunInline:
 		tw.stats.queued.Add(1)
 		select {
 		case tw.workCh <- item:
+			return executeAccepted
 		default:
 			tw.stats.queued.Add(-1)
-			tw.runJob(item)
+			tw.runJob(item, true)
+			return executeAccepted
 		}
 	default:
 		tw.stats.queued.Add(1)
 		select {
 		case tw.workCh <- item:
+			return executeAccepted
 		case <-tw.ctx.Done():
 			tw.stats.queued.Add(-1)
+			return executeCanceled
 		}
 	}
 }
@@ -740,12 +769,12 @@ func (tw *TimeWheel[T]) worker() {
 			return
 		case item := <-tw.workCh:
 			tw.stats.queued.Add(-1)
-			tw.runJob(item)
+			tw.runJob(item, false)
 		}
 	}
 }
 
-func (tw *TimeWheel[T]) runJob(item workItem[T]) {
+func (tw *TimeWheel[T]) runJob(item workItem[T], inlineCompletion bool) {
 	startedAt := tw.cfg.clock.Now()
 	event := JobEvent[T]{
 		TimerID:      item.id,
@@ -770,11 +799,11 @@ func (tw *TimeWheel[T]) runJob(item workItem[T]) {
 					tw.cfg.errorHandler(r)
 				}
 			}
-			tw.finishJob(item, event)
+			tw.finishJob(item, event, inlineCompletion)
 		}()
 	} else {
 		defer func() {
-			tw.finishJob(item, event)
+			tw.finishJob(item, event, inlineCompletion)
 		}()
 	}
 
@@ -785,7 +814,7 @@ func (tw *TimeWheel[T]) runJob(item workItem[T]) {
 	item.job(item.data)
 }
 
-func (tw *TimeWheel[T]) finishJob(item workItem[T], event JobEvent[T]) {
+func (tw *TimeWheel[T]) finishJob(item workItem[T], event JobEvent[T], inlineCompletion bool) {
 	finishedAt := tw.cfg.clock.Now()
 	event.FinishedAt = finishedAt
 	event.Duration = finishedAt.Sub(event.StartedAt)
@@ -799,18 +828,25 @@ func (tw *TimeWheel[T]) finishJob(item workItem[T], event JobEvent[T]) {
 		return
 	}
 
+	done := jobDone[T]{
+		id:         item.id,
+		data:       item.data,
+		job:        item.job,
+		contextJob: item.contextJob,
+		delay:      item.delay,
+		repeatMode: item.repeatMode,
+	}
+	if inlineCompletion {
+		tw.finishRepeatingJob(done)
+		return
+	}
+
 	select {
 	case tw.commandCh <- wheelCommand[T]{
 		kind: commandJobDone,
-		done: jobDone[T]{
-			id:         item.id,
-			data:       item.data,
-			job:        item.job,
-			contextJob: item.contextJob,
-			delay:      item.delay,
-			repeatMode: item.repeatMode,
-		},
+		done: done,
 	}:
+	case <-tw.ctx.Done():
 	case <-tw.done:
 	}
 }
