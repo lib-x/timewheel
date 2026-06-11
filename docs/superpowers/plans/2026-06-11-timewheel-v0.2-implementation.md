@@ -1,25 +1,25 @@
-# timewheel v2 Implementation Plan
+# timewheel v0.2 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
-**Goal:** Implement the approved breaking v2 API and runtime semantics, then verify, commit, push, and tag `v2.0.0`.
+**Goal:** Implement the approved breaking v0.2 API and runtime semantics, then verify, commit, push, and tag `v0.2.0`.
 
 **Architecture:** Keep the public package small while making state and command handling explicit. The event loop remains the single owner of timer placement and removal; public methods synchronize through commands with acknowledgements. Worker execution moves from semaphore-gated goroutines to a bounded queue with explicit backpressure policies.
 
-**Tech Stack:** Go 1.25, standard library only, `go test ./...`, Git tags using Go semantic import versioning with module path `github.com/lib-x/timewheel/v2`.
+**Tech Stack:** Go 1.25, standard library only, `go test ./...`, Git tag `v0.2.0`, and module path `github.com/lib-x/timewheel`.
 
 ---
 
 ## File Structure
 
-- Modify `go.mod`: change module path to `github.com/lib-x/timewheel/v2`.
+- Modify `go.mod`: keep module path as `github.com/lib-x/timewheel`.
 - Modify `timewheel.go`: define `TimerID`, sentinel errors, lifecycle state, timer command types, timer index locations, scheduling, repeat modes, observer events, and public methods.
 - Modify `options.go`: define worker queue config, backpressure policy, observer/error handler options, and test clock option.
 - Create `clock.go`: real clock/ticker abstraction used by runtime and fake tests.
 - Create `fake_clock_test.go`: deterministic fake clock and ticker helpers for tests.
-- Modify `timewheel_test.go`: update all tests to v2 API and add lifecycle, repeat mode, queue, observer, and delete-index coverage.
-- Modify `README.md`: document v2 module path, lifecycle contract, errors, repeat modes, queue semantics, inspection semantics, and deletion complexity.
-- Keep `docs/superpowers/specs/2026-06-11-timewheel-v2-design.md` and this plan in the final commit.
+- Modify `timewheel_test.go`: update all tests to the v0.2 API and add lifecycle, repeat mode, queue, observer, and delete-index coverage.
+- Modify `README.md`: document module path, lifecycle contract, errors, repeat modes, queue semantics, inspection semantics, and deletion complexity.
+- Keep `docs/superpowers/specs/2026-06-11-timewheel-v0.2-design.md` and this plan in the final commit.
 
 ## Task 1: Module Path, Public Types, and Lifecycle Contract
 
@@ -128,7 +128,7 @@ const (
 )
 ```
 
-Make `Start(ctx) error`, `Stop() error`, `Close() error`, and `Wait()` follow the v2 design. Add public methods returning errors:
+Make `Start(ctx) error`, `Stop() error`, `Close() error`, and `Wait()` follow the v0.2 design. Add public methods returning errors:
 
 ```go
 func (tw *TimeWheel[T]) AddTimer(delay time.Duration, data T) (TimerID, error)
@@ -448,7 +448,7 @@ Create `fake_clock_test.go` with a manual ticker and use `withClock` test option
 
 Document:
 
-- module path `github.com/lib-x/timewheel/v2`
+- module path `github.com/lib-x/timewheel`
 - `Start`, `Stop`, `Close`, `Wait` behavior
 - error-returning `Add*` and `RemoveTimer`
 - `TimerID`
@@ -483,8 +483,8 @@ git rev-parse HEAD
 Then commit intended files:
 
 ```bash
-git add go.mod *.go README.md docs/superpowers/specs/2026-06-11-timewheel-v2-design.md docs/superpowers/plans/2026-06-11-timewheel-v2-implementation.md
-git commit -m "feat!: redesign timewheel v2 API"
+git add go.mod *.go README.md docs/superpowers/specs/2026-06-11-timewheel-v0.2-design.md docs/superpowers/plans/2026-06-11-timewheel-v0.2-implementation.md
+git commit -m "feat!: redesign timewheel v0.2 API"
 ```
 
 - [x] **Step 6: Push and tag**
@@ -498,10 +498,10 @@ git ls-remote origin refs/heads/main
 git ls-remote --tags origin
 ```
 
-Create and push the v2 tag:
+Create and push the v0.2 tag:
 
 ```bash
 git push origin main
-git tag -a v2.0.0 -m "v2.0.0"
-git push origin v2.0.0
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
 ```

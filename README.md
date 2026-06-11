@@ -1,6 +1,6 @@
 # timewheel
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/lib-x/timewheel/v2.svg)](https://pkg.go.dev/github.com/lib-x/timewheel/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/lib-x/timewheel.svg)](https://pkg.go.dev/github.com/lib-x/timewheel)
 [![Go Report Card](https://goreportcard.com/badge/github.com/lib-x/timewheel)](https://goreportcard.com/report/github.com/lib-x/timewheel)
 
 A generic timer wheel for Go.
@@ -12,7 +12,7 @@ Go 1.25 or later.
 ## Installation
 
 ```bash
-go get github.com/lib-x/timewheel/v2
+go get github.com/lib-x/timewheel
 ```
 
 ## Quick Start
@@ -26,7 +26,7 @@ import (
     "log"
     "time"
 
-    "github.com/lib-x/timewheel/v2"
+    "github.com/lib-x/timewheel"
 )
 
 func main() {

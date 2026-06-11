@@ -1,3 +1,3 @@
-module github.com/lib-x/timewheel/v2
+module github.com/lib-x/timewheel
 
 go 1.25

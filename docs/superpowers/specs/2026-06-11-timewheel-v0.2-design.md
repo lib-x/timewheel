@@ -1,14 +1,14 @@
-# timewheel v2 API and Runtime Design
+# timewheel v0.2 API and Runtime Design
 
 Date: 2026-06-11
 
 ## Goal
 
-Ship a breaking v2 API for `github.com/lib-x/timewheel/v2` while the library is still new. The v2 API should make lifecycle, cancellation, repeating behavior, queueing, and inspection semantics explicit enough for production use.
+Ship a breaking v0.2 API for `github.com/lib-x/timewheel` while the library is still new. The v0.2 API should make lifecycle, cancellation, repeating behavior, queueing, and inspection semantics explicit enough for production use.
 
 Go version changes are out of scope for this design.
 
-The module path must change to `github.com/lib-x/timewheel/v2` before tagging `v2.0.0`, following Go's semantic import versioning rules.
+The module path remains `github.com/lib-x/timewheel`; this release is tagged `v0.2.0`.
 
 ## Non-Goals
 
